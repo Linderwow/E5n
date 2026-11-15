@@ -1,5 +1,6 @@
 #region Using declarations
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
@@ -17,26 +18,26 @@ namespace NinjaTrader.NinjaScript.Strategies
 	{
 		private static readonly CultureInfo CI = CultureInfo.InvariantCulture;
 		private E5nEngine engine;
+		private E5nBand band;
 		private TimeZoneInfo etZone;
-		private string blockNote, logDir, statusPath, eventsPath, fillsPath, decisionsPath, liveSince = "", haltNote = "", lastModel = "";
+		private string blockNote, logDir, barsDir, statusPath, eventsPath, fillsPath, decisionsPath, liveSince = "", haltNote = "", lastModel = "";
 		private StreamWriter decisionLog;
-		private bool refused, isBacktest, etWarned, halted;
-		private DateTime dayKey = DateTime.MinValue, lastBarEt = DateTime.MinValue;
-		private double dayStartRealized, lastForecast = double.NaN;
-		private int lastTarget, lastMinute, decisionsToday;
-		private bool undo;
+		private bool refused, isBacktest, etWarned, halted, undo, addBack, bandOff, barLive, stuckNoted;
+		private DateTime dayKey = DateTime.MinValue, lastBarEt = DateTime.MinValue, barDay = DateTime.MinValue;
+		private double dayStartRealized, lastForecast = double.NaN, lastCheck = double.NaN;
+		private int legModel, legBand, lastNet, lastMinute, decisionsToday, working, workingBar;
 		private DateTime[] rollDates = new DateTime[0];
 		private double[] rollOffsets = new double[0];
+		private readonly List<string> barBuf = new List<string>();
 
 		protected override void OnStateChange()
 		{
 			if (State == State.SetDefaults)
 			{
 				Name								= "E5nStrategy";
-				Description							= "E5n: a gradient-boosted forecast of the next 5 minutes from 83 indicators on one-minute MNQ bars; long, short or flat every 5 minutes, flat at 16:00 ET.";
+				Description							= "E5n: two legs on one-minute MNQ bars, traded as one net position. Model leg: a gradient-boosted forecast of the next 5 minutes, confirmed by a 15-minute forecast. Band leg: breakouts beyond the day's volatility band. Flat at 16:00 ET.";
 				Calculate							= Calculate.OnBarClose;
-				EntriesPerDirection					= 1;
-				EntryHandling						= EntryHandling.AllEntries;
+				IsUnmanaged							= true;
 				IsExitOnSessionCloseStrategy		= true;
 				ExitOnSessionCloseSeconds			= 120;
 				IsFillLimitOnTouch					= false;
@@ -47,15 +48,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 				TimeInForce							= TimeInForce.Day;
 				TraceOrders							= false;
 				RealtimeErrorHandling				= RealtimeErrorHandling.StopCancelClose;
-				StopTargetHandling					= StopTargetHandling.PerEntryExecution;
 				BarsRequiredToTrade					= 0;
 				IsInstantiatedOnEachOptimizationIteration = true;
 
 				Contracts		= 1;
+				Check15			= true;
+				BandContracts	= 1;
 				WarmupSessions	= 20;
 				MaxDailyLoss	= 0;
 				ModelFile		= "";
+				CheckModelFile	= "";
 				WriteDecisions	= true;
+				WriteBars		= true;
 				UndoBackAdjustment = true;
 			}
 			else if (State == State.DataLoaded)
@@ -67,15 +71,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 				string inst = Instrument != null ? Instrument.MasterInstrument.Name : "inst";
 				string root = Path.Combine(Core.Globals.UserDataDir, "e5n");
 				string model = string.IsNullOrWhiteSpace(ModelFile) ? Path.Combine(root, "e5n_models.txt") : ModelFile.Trim();
+				string check = string.IsNullOrWhiteSpace(CheckModelFile) ? Path.Combine(root, "e5n_models_15min.txt") : CheckModelFile.Trim();
 				if (BarsPeriod == null || BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || BarsPeriod.Value != 1)
 					blockNote = string.Format(CI, "the data series is {0} but E5n runs on 1 Minute bars only - set Data Series to Minute, 1 and run again",
 						BarsPeriod == null ? "unknown" : BarsPeriod.Value.ToString(CI) + " " + BarsPeriod.BarsPeriodType);
+				else if (Contracts == 0 && BandContracts == 0)
+					blockNote = "both legs are set to 0 contracts - set 'Model-leg contracts' or 'Band-leg contracts' to 1 or more";
 				else if (!File.Exists(model))
 					blockNote = "model file not found: " + model + " - install it (see the README) or set 'Model file'";
+				else if (Check15 && !File.Exists(check))
+					blockNote = "15-minute check model file not found: " + check + " - install it (see the README), set 'Check model file' or switch '15-minute check' off";
 				else
 				{
-					try { engine = new E5nEngine(E5nModelSet.Load(model), WarmupSessions); }
-					catch (Exception ex) { blockNote = "model file could not be loaded (" + model + "): " + ex.Message; }
+					try { engine = new E5nEngine(E5nModelSet.Load(model), Check15 ? E5nModelSet.Load(check) : null, WarmupSessions); }
+					catch (Exception ex) { blockNote = "model files could not be loaded (" + model + "): " + ex.Message; }
+					if (BandContracts > 0) band = new E5nBand(WarmupSessions);
 				}
 				if (blockNote == null && !isBacktest)
 				{
@@ -88,15 +98,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 					MergePolicy mp = Instrument.MasterInstrument.MergePolicy;
 					if (mp == MergePolicy.UseGlobalSettings || mp == MergePolicy.UseDefault) mp = Core.Globals.MarketDataOptions.GlobalMergePolicy;
 					undo = UndoBackAdjustment && mp == MergePolicy.MergeBackAdjusted;
-					System.Collections.Generic.List<DateTime> rd = new System.Collections.Generic.List<DateTime>();
-					System.Collections.Generic.List<double> ro = new System.Collections.Generic.List<double>();
+					addBack = mp == MergePolicy.MergeNonBackAdjusted;
+					List<DateTime> rd = new List<DateTime>();
+					List<double> ro = new List<double>();
 					int loaded = Instrument.Expiry.Year * 12 + Instrument.Expiry.Month;
 					foreach (Rollover r in Instrument.MasterInstrument.RolloverCollection)
 						if (r.ContractMonth.Year * 12 + r.ContractMonth.Month <= loaded) { rd.Add(r.Date.Date); ro.Add(r.Offset); }
 					rollDates = rd.ToArray(); rollOffsets = ro.ToArray();
-					Print(string.Format(CI, "E5nStrategy: merge policy {0}, {1} rollovers up to {2:MM-yy}; back-adjustment {3}", mp, rollDates.Length, Instrument.Expiry, undo ? "is removed before the model sees prices" : "not applied or left as is"));
+					Print(string.Format(CI, "E5nStrategy: merge policy {0}, {1} rollovers up to {2:MM-yy}; model leg sees prices {3}, band leg sees {4}", mp, rollDates.Length, Instrument.Expiry,
+						undo ? "as traded (back-adjustment removed)" : "as loaded", addBack ? "the continuous series (roll offsets added)" : "the series as loaded"));
 				}
-				catch (Exception ex) { undo = false; Print("E5nStrategy: rollover table not read (" + ex.Message + ") - prices used as loaded"); }
+				catch (Exception ex) { undo = false; addBack = false; Print("E5nStrategy: rollover table not read (" + ex.Message + ") - prices used as loaded"); }
 				try
 				{
 					logDir = Path.Combine(root, "logs");
@@ -108,22 +120,48 @@ namespace NinjaTrader.NinjaScript.Strategies
 					decisionsPath = Path.Combine(logDir, "E5n_decisions_" + tag + ".csv");
 					if (WriteDecisions)
 					{
+						string head = "date,time_et,minute,forecast,base_target,check,target,model,band,net,position,close,adjustment,sessions";
 						bool fresh = isBacktest || !File.Exists(decisionsPath);
+						if (!fresh)
+						{
+							string first = "";
+							using (StreamReader sr = new StreamReader(new FileStream(decisionsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))) first = sr.ReadLine() ?? "";
+							if (first != head)
+							{
+								File.Move(decisionsPath, Path.Combine(logDir, "E5n_decisions_" + tag + "_to_" + DateTime.Now.ToString("yyyyMMdd_HHmmss", CI) + ".csv"));
+								fresh = true;
+							}
+						}
 						decisionLog = new StreamWriter(new FileStream(decisionsPath, isBacktest ? FileMode.Create : FileMode.Append, FileAccess.Write, FileShare.ReadWrite), Encoding.ASCII);
-						if (fresh) decisionLog.WriteLine("date,time_et,minute,forecast,target,model,position,close,adjustment,sessions");
+						if (fresh) decisionLog.WriteLine(head);
+					}
+					if (Instrument != null)
+					{
+						string bars = Path.Combine(root, "bars");
+						Directory.CreateDirectory(bars);
+						StringBuilder sb = new StringBuilder("date,offset" + Environment.NewLine);
+						for (int i = 0; i < rollDates.Length; i++) sb.AppendLine(string.Format(CI, "{0:yyyy-MM-dd},{1}", rollDates[i], rollOffsets[i]));
+						File.WriteAllText(Path.Combine(bars, "rollovers_" + inst + ".csv"), sb.ToString());
+						if (WriteBars && !isBacktest)
+						{
+							barsDir = Path.Combine(bars, inst + "_" + Instrument.Expiry.ToString("MM-yy", CI));
+							Directory.CreateDirectory(barsDir);
+						}
 					}
 				}
-				catch (Exception ex) { Print("E5nStrategy: cannot create log files: " + ex.Message); decisionLog = null; }
+				catch (Exception ex) { Print("E5nStrategy: cannot create log files: " + ex.Message); decisionLog = null; barsDir = null; }
 			}
 			else if (State == State.Transition)
 			{
+				working = 0;
 				liveSince = ToEt(DateTime.Now).ToString("yyyy-MM-dd HH:mm:ss", CI);
-				LogEvent("live", string.Format(CI, "contracts {0}, warm-up sessions {1}, daily loss stop {2:0}, sessions in history {3}, start {4}, on error {5}",
-					Contracts, WarmupSessions, MaxDailyLoss, engine != null ? engine.Sessions : 0, StartBehavior, RealtimeErrorHandling));
+				LogEvent("live", string.Format(CI, "model-leg contracts {0}, 15-minute check {1}, band-leg contracts {2}, warm-up sessions {3}, daily loss stop {4:0}, sessions in history {5}, band days {6}, start {7}, on error {8}",
+					Contracts, Check15 ? "on" : "off", BandContracts, WarmupSessions, MaxDailyLoss, engine != null ? engine.Sessions : 0, band != null ? band.Days : 0, StartBehavior, RealtimeErrorHandling));
 			}
 			else if (State == State.Terminated)
 			{
 				if (decisionLog != null) { try { decisionLog.Flush(); decisionLog.Dispose(); } catch { } decisionLog = null; }
+				if (!barLive) FlushBars();
 				if (liveSince != "")
 				{
 					LogEvent("terminated", string.Format(CI, "position {0} x{1}", Position.MarketPosition, Position.Quantity));
@@ -153,18 +191,31 @@ namespace NinjaTrader.NinjaScript.Strategies
 			DateTime start = et.AddMinutes(-1);
 			if (start.Date != dayKey)
 			{
-				dayKey = start.Date; halted = false; haltNote = ""; decisionsToday = 0;
+				dayKey = start.Date; halted = false; haltNote = ""; decisionsToday = 0; legModel = 0;
 				dayStartRealized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
 			}
-			int cur = Position.MarketPosition == MarketPosition.Long ? 1 : Position.MarketPosition == MarketPosition.Short ? -1 : 0;
-			int want = cur;
-			double adj = undo ? Adjustment(start.Date) : 0.0;
+			int cur = Position.MarketPosition == MarketPosition.Long ? Position.Quantity : Position.MarketPosition == MarketPosition.Short ? -Position.Quantity : 0;
+			double shift = Adjustment(start.Date);
+			double adj = undo ? shift : 0.0, add = addBack ? shift : 0.0;
 			E5nDecision d = engine.OnMinute(et, Open[0] - adj, High[0] - adj, Low[0] - adj, Close[0] - adj, Volume[0], ContractKey(start.Date));
 			if (d != null)
 			{
 				decisionsToday++;
-				lastMinute = d.Minute; lastForecast = d.Forecast; lastModel = d.Model;
-				if (d.HasForecast) { want = d.Target; lastTarget = d.Target; }
+				lastMinute = d.Minute; lastForecast = d.Forecast; lastCheck = d.Check; lastModel = d.Model;
+				if (d.HasForecast) legModel = d.Target;
+			}
+			if (band != null)
+			{
+				legBand = band.OnMinute(et, Open[0] + add, High[0] + add, Low[0] + add, Close[0] + add, Volume[0]);
+				if (!bandOff && band.TradingDay && band.OvernightBars == 0)
+				{
+					bandOff = true;
+					string note = "the band leg is OFF: the loaded bars have no overnight session, and it needs the full session (trading hours template CME US Index Futures ETH)";
+					Print("E5nStrategy: " + note);
+					try { Log("E5nStrategy: " + note, LogLevel.Error); } catch { }
+					LogEvent("band_off", note, true);
+				}
+				if (bandOff) legBand = 0;
 			}
 			if (MaxDailyLoss > 0 && !halted)
 			{
@@ -179,25 +230,62 @@ namespace NinjaTrader.NinjaScript.Strategies
 				}
 			}
 			int m = start.Hour * 60 + start.Minute;
-			if (halted || m >= 959 || m < 570) want = 0;
-			if (want != cur)
+			if (m >= 959 || m < 570) legModel = 0;
+			int want = halted || m >= 959 || m < 570 ? 0 : legModel * Contracts + legBand * BandContracts;
+			lastNet = want;
+			if (working > 0 && CurrentBar - workingBar >= 2)
 			{
-				if (want > 0) EnterLong(Contracts, "E5nLong");
-				else if (want < 0) EnterShort(Contracts, "E5nShort");
-				else if (cur > 0) ExitLong("E5nFlat", "E5nLong");
-				else ExitShort("E5nFlat", "E5nShort");
+				if (!stuckNoted) { stuckNoted = true; LogEvent("order_pending", string.Format(CI, "{0} order(s) still not final after 2 bars - the position is re-read and orders resume", working), true); }
+				working = 0;
 			}
+			if (want != cur && working == 0) Trade(cur, want);
 			if (d != null && decisionLog != null && (isBacktest || State == State.Realtime))
 			{
 				try
 				{
-					decisionLog.WriteLine(string.Format(CI, "{0:yyyy-MM-dd},{1:HH:mm},{2},{3},{4},{5},{6},{7},{8},{9}", d.Date, et, d.Minute,
-						d.HasForecast ? d.Forecast.ToString("R", CI) : "", d.HasForecast ? d.Target.ToString(CI) : "", d.Model, cur, (Close[0] - adj).ToString(CI), adj.ToString(CI), engine.Sessions));
+					decisionLog.WriteLine(string.Format(CI, "{0:yyyy-MM-dd},{1:HH:mm},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13}", d.Date, et, d.Minute,
+						d.HasForecast ? d.Forecast.ToString("R", CI) : "", d.HasForecast ? d.BaseTarget.ToString(CI) : "", d.HasForecast && !double.IsNaN(d.Check) ? d.Check.ToString("R", CI) : "",
+						d.HasForecast ? d.Target.ToString(CI) : "", d.Model, band != null ? legBand.ToString(CI) : "", want, cur, (Close[0] - adj).ToString(CI), adj.ToString(CI), engine.Sessions));
 					if (State == State.Realtime) decisionLog.Flush();
 				}
 				catch { }
 			}
+			if (barsDir != null) LogBar(et, start, Open[0] - adj, High[0] - adj, Low[0] - adj, Close[0] - adj, Volume[0]);
 			if (State == State.Realtime && (d != null || m >= 959)) WriteStatus(halted ? "halted" : "running");
+		}
+
+		private void Trade(int cur, int want)
+		{
+			workingBar = CurrentBar;
+			if (cur > 0 && want < cur)
+			{
+				Send(OrderAction.Sell, cur - Math.Max(want, 0), "E5nSell");
+				if (want < 0) Send(OrderAction.SellShort, -want, "E5nShort");
+			}
+			else if (cur < 0 && want > cur)
+			{
+				Send(OrderAction.BuyToCover, Math.Min(want, 0) - cur, "E5nCover");
+				if (want > 0) Send(OrderAction.Buy, want, "E5nLong");
+			}
+			else if (want > cur) Send(OrderAction.Buy, want - cur, "E5nLong");
+			else Send(OrderAction.SellShort, cur - want, "E5nShort");
+		}
+
+		private void Send(OrderAction action, int quantity, string name)
+		{
+			if (quantity <= 0) return;
+			working++;
+			SubmitOrderUnmanaged(0, action, OrderType.Market, quantity, 0, 0, "", name);
+		}
+
+		protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity, int filled, double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string comment)
+		{
+			if (order == null || order.Name == null || !order.Name.StartsWith("E5n")) return;
+			if (orderState == OrderState.Filled || orderState == OrderState.Cancelled || orderState == OrderState.Rejected)
+			{
+				if (working > 0) working--;
+				if (orderState == OrderState.Rejected) LogEvent("order_rejected", string.Format(CI, "{0} {1} x{2}: {3} {4}", order.Name, order.OrderAction, quantity, error, comment), true);
+			}
 		}
 
 		protected override void OnExecutionUpdate(Execution execution, string executionId, double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
@@ -210,6 +298,44 @@ namespace NinjaTrader.NinjaScript.Strategies
 					quantity, price, Position.MarketPosition == MarketPosition.Long ? Position.Quantity : Position.MarketPosition == MarketPosition.Short ? -Position.Quantity : 0, Environment.NewLine));
 			}
 			catch (Exception ex) { Print("E5nStrategy: fill log write failed: " + ex.Message); }
+		}
+
+		private void LogBar(DateTime et, DateTime start, double o, double h, double l, double c, double v)
+		{
+			for (int i = 0; i < rollDates.Length; i++) if (rollDates[i] > start.Date) return;
+			if (start.Date != barDay)
+			{
+				if (!barLive) FlushBars();
+				barDay = start.Date; barBuf.Clear(); barLive = false;
+			}
+			string line = string.Format(CI, "{0:yyyy-MM-dd HH:mm},{1},{2},{3},{4},{5}", et, o, h, l, c, v);
+			if (State != State.Realtime) { barBuf.Add(line); return; }
+			try
+			{
+				if (!barLive) { FlushBars(); barLive = true; }
+				string path = Path.Combine(barsDir, barDay.ToString("yyyy-MM-dd", CI) + ".csv");
+				if (!File.Exists(path)) File.WriteAllText(path, "time_et,open,high,low,close,volume" + Environment.NewLine);
+				File.AppendAllText(path, line + Environment.NewLine);
+			}
+			catch (Exception ex) { Print("E5nStrategy: bar log write failed: " + ex.Message); }
+		}
+
+		private void FlushBars()
+		{
+			if (barsDir == null || barBuf.Count == 0 || barDay == DateTime.MinValue) return;
+			try
+			{
+				string path = Path.Combine(barsDir, barDay.ToString("yyyy-MM-dd", CI) + ".csv");
+				int have = File.Exists(path) ? File.ReadAllLines(path).Length - 1 : -1;
+				if (have < barBuf.Count)
+				{
+					StringBuilder sb = new StringBuilder("time_et,open,high,low,close,volume" + Environment.NewLine);
+					for (int i = 0; i < barBuf.Count; i++) sb.AppendLine(barBuf[i]);
+					File.WriteAllText(path, sb.ToString());
+				}
+			}
+			catch (Exception ex) { Print("E5nStrategy: bar log write failed: " + ex.Message); }
+			barBuf.Clear();
 		}
 
 		private string OtherStrategy()
@@ -271,10 +397,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				bool connected = Account != null && Account.Connection != null && Account.Connection.Status == ConnectionStatus.Connected;
 				string json = string.Format(CI,
-					"{{\"state\":\"{0}\",\"updated_et\":\"{1:yyyy-MM-dd HH:mm:ss}\",\"last_bar\":\"{2:yyyy-MM-dd HH:mm:ss}\",\"account\":\"{3}\",\"instrument\":\"{4}\",\"position\":\"{5}\",\"quantity\":{6},\"target\":{7},\"last_minute\":{8},\"last_forecast\":{9},\"threshold\":{10},\"model\":\"{11}\",\"sessions\":{12},\"warm\":{13},\"decisions_today\":{14},\"contracts\":{15},\"max_daily_loss\":{16},\"halt_note\":\"{17}\",\"connected\":{18},\"live_since\":\"{19}\"}}",
+					"{{\"state\":\"{0}\",\"updated_et\":\"{1:yyyy-MM-dd HH:mm:ss}\",\"last_bar\":\"{2:yyyy-MM-dd HH:mm:ss}\",\"account\":\"{3}\",\"instrument\":\"{4}\",\"position\":\"{5}\",\"quantity\":{6},\"net_target\":{7},\"model_target\":{8},\"band_target\":{9},\"last_minute\":{10},\"last_forecast\":{11},\"last_check\":{12},\"threshold\":{13},\"model\":\"{14}\",\"sessions\":{15},\"warm\":{16},\"band_days\":{17},\"decisions_today\":{18},\"contracts\":{19},\"check15\":{20},\"band_contracts\":{21},\"band_off\":{22},\"max_daily_loss\":{23},\"halt_note\":\"{24}\",\"connected\":{25},\"live_since\":\"{26}\"}}",
 					state, ToEt(DateTime.Now), lastBarEt, Account != null ? Account.Name : "", Instrument != null ? Instrument.FullName : "", Position.MarketPosition, Position.Quantity,
-					lastTarget, lastMinute, double.IsNaN(lastForecast) ? "null" : lastForecast.ToString("R", CI), engine != null ? engine.Threshold.ToString("R", CI) : "null", lastModel,
-					engine != null ? engine.Sessions : 0, engine != null && engine.Warm ? "true" : "false", decisionsToday, Contracts, MaxDailyLoss,
+					lastNet, legModel, legBand, lastMinute, double.IsNaN(lastForecast) ? "null" : lastForecast.ToString("R", CI), double.IsNaN(lastCheck) ? "null" : lastCheck.ToString("R", CI),
+					engine != null ? engine.Threshold.ToString("R", CI) : "null", lastModel, engine != null ? engine.Sessions : 0, engine != null && engine.Warm ? "true" : "false",
+					band != null ? band.Days : 0, decisionsToday, Contracts, Check15 ? "true" : "false", BandContracts, bandOff ? "true" : "false", MaxDailyLoss,
 					(haltNote ?? "").Replace("\\", "/").Replace("\"", "'"), connected ? "true" : "false", liveSince);
 				File.WriteAllText(statusPath, json);
 			}
@@ -282,12 +409,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 		}
 
 		#region Properties
-		[NinjaScriptProperty] [Range(1, 50)] [Display(Name = "Contracts", Description = "Micros per position.", GroupName = "1. E5n", Order = 1)] public int Contracts { get; set; }
-		[NinjaScriptProperty] [Range(0, 250)] [Display(Name = "Warm-up sessions", Description = "Complete 09:30-16:00 ET sessions needed in the loaded history before the first trade (20 fills every look-back).", GroupName = "1. E5n", Order = 2)] public int WarmupSessions { get; set; }
-		[NinjaScriptProperty] [Range(0, 100000)] [Display(Name = "Daily loss stop ($, 0 = off)", Description = "Flat for the rest of the day once the day's realized plus open loss reaches this amount. 0 = as tested.", GroupName = "1. E5n", Order = 3)] public double MaxDailyLoss { get; set; }
-		[NinjaScriptProperty] [Display(Name = "Model file (blank = default)", Description = "Blank uses <NinjaTrader 8 documents folder>\\e5n\\e5n_models.txt.", GroupName = "1. E5n", Order = 4)] public string ModelFile { get; set; }
-		[NinjaScriptProperty] [Display(Name = "Undo back-adjustment", Description = "With merge policy 'Merge back adjusted' NinjaTrader shifts older contracts' prices; the model was trained on prices as traded, so the shift is removed with the instrument's rollover offsets. Leave on.", GroupName = "1. E5n", Order = 6)] public bool UndoBackAdjustment { get; set; }
-		[NinjaScriptProperty] [Display(Name = "Write decision log", Description = "Every 5-minute decision to e5n\\logs (a backtest overwrites its own file).", GroupName = "1. E5n", Order = 5)] public bool WriteDecisions { get; set; }
+		[NinjaScriptProperty] [Range(0, 50)] [Display(Name = "Model-leg contracts", Description = "Micros for the forecast leg (0 = leg off).", GroupName = "1. E5n", Order = 1)] public int Contracts { get; set; }
+		[NinjaScriptProperty] [Display(Name = "15-minute check", Description = "The forecast leg trades only when a second model of the next 15 minutes points the same way. On = as tested for the two-leg book.", GroupName = "1. E5n", Order = 2)] public bool Check15 { get; set; }
+		[NinjaScriptProperty] [Range(0, 50)] [Display(Name = "Band-leg contracts", Description = "Micros for the band-breakout leg (0 = leg off). Both legs trade as one net position.", GroupName = "1. E5n", Order = 3)] public int BandContracts { get; set; }
+		[NinjaScriptProperty] [Range(0, 250)] [Display(Name = "Warm-up sessions", Description = "Complete 09:30-16:00 ET sessions needed in the loaded history before the first trade (20 fills every look-back).", GroupName = "1. E5n", Order = 4)] public int WarmupSessions { get; set; }
+		[NinjaScriptProperty] [Range(0, 100000)] [Display(Name = "Daily loss stop ($, 0 = off)", Description = "Flat for the rest of the day once the day's realized plus open loss reaches this amount. 0 = as tested.", GroupName = "1. E5n", Order = 5)] public double MaxDailyLoss { get; set; }
+		[NinjaScriptProperty] [Display(Name = "Model file (blank = default)", Description = "Blank uses <NinjaTrader 8 documents folder>\\e5n\\e5n_models.txt.", GroupName = "1. E5n", Order = 6)] public string ModelFile { get; set; }
+		[NinjaScriptProperty] [Display(Name = "Check model file (blank = default)", Description = "Blank uses <NinjaTrader 8 documents folder>\\e5n\\e5n_models_15min.txt.", GroupName = "1. E5n", Order = 7)] public string CheckModelFile { get; set; }
+		[NinjaScriptProperty] [Display(Name = "Write decision log", Description = "Every 5-minute decision to e5n\\logs (a backtest overwrites its own file).", GroupName = "1. E5n", Order = 8)] public bool WriteDecisions { get; set; }
+		[NinjaScriptProperty] [Display(Name = "Write 1-minute bars", Description = "The one-minute bars the strategy sees, one file a day in e5n\\bars, for the nightly forward ledger (not in a backtest).", GroupName = "1. E5n", Order = 9)] public bool WriteBars { get; set; }
+		[NinjaScriptProperty] [Display(Name = "Undo back-adjustment", Description = "With merge policy 'Merge back adjusted' NinjaTrader shifts older contracts' prices; the forecast models were trained on prices as traded, so the shift is removed with the instrument's rollover offsets. Leave on.", GroupName = "1. E5n", Order = 10)] public bool UndoBackAdjustment { get; set; }
 		#endregion
 	}
 }

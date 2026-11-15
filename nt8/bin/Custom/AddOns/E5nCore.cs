@@ -306,6 +306,8 @@ namespace E5nLib
 		public bool HasForecast;
 		public double Forecast;
 		public int Target;
+		public int BaseTarget;
+		public double Check;
 		public string Model;
 		public double[] Features;
 	}
@@ -316,6 +318,7 @@ namespace E5nLib
 		public const int First = 15, Last = 385, Step = 5, Bars = 390;
 
 		readonly E5nModelSet models;
+		readonly E5nModelSet check;
 		readonly int warmup;
 		readonly int[] tfs = { 5, 15, 30 };
 		E5nTf[] tf = { new E5nTf(), new E5nTf(), new E5nTf() };
@@ -338,6 +341,7 @@ namespace E5nLib
 		public bool SessionOpen { get { return open; } }
 		public bool Warm { get { return Sessions >= warmup; } }
 		public double Threshold { get { return models.Threshold; } }
+		public bool HasCheck { get { return check != null; } }
 
 		static string[] BuildNames()
 		{
@@ -350,9 +354,17 @@ namespace E5nLib
 			return f.ToArray();
 		}
 
-		public E5nEngine(E5nModelSet modelSet, int warmupSessions)
+		public E5nEngine(E5nModelSet modelSet, int warmupSessions) : this(modelSet, null, warmupSessions) { }
+
+		public E5nEngine(E5nModelSet modelSet, E5nModelSet checkSet, int warmupSessions)
 		{
-			models = modelSet; warmup = warmupSessions;
+			models = modelSet; check = checkSet; warmup = warmupSessions;
+			if (check != null)
+			{
+				if (check.Features.Length != FeatureNames.Length) throw new InvalidDataException("check model file has " + check.Features.Length + " features, the engine " + FeatureNames.Length);
+				for (int i = 0; i < FeatureNames.Length; i++)
+					if (check.Features[i] != FeatureNames[i]) throw new InvalidDataException("feature " + i + " is '" + check.Features[i] + "' in the check model file, '" + FeatureNames[i] + "' in the engine");
+			}
 			if (models.Features.Length != FeatureNames.Length) throw new InvalidDataException("model file has " + models.Features.Length + " features, the engine " + FeatureNames.Length);
 			for (int i = 0; i < FeatureNames.Length; i++)
 				if (models.Features[i] != FeatureNames[i]) throw new InvalidDataException("feature " + i + " is '" + models.Features[i] + "' in the model file, '" + FeatureNames[i] + "' in the engine");
@@ -509,10 +521,185 @@ namespace E5nLib
 			E5nDecision d = new E5nDecision();
 			d.Date = sessDate; d.Minute = p_; d.Features = x;
 			E5nModel model = models.For(sessDate);
+			d.Check = nan;
 			if (model == null || !Warm) { d.HasForecast = false; d.Forecast = nan; d.Model = model == null ? "" : model.Name; return d; }
 			d.HasForecast = true; d.Model = model.Name; d.Forecast = model.Predict(x);
-			d.Target = d.Forecast > models.Threshold ? 1 : d.Forecast < -models.Threshold ? -1 : 0;
+			d.BaseTarget = d.Forecast > models.Threshold ? 1 : d.Forecast < -models.Threshold ? -1 : 0;
+			d.Target = d.BaseTarget;
+			if (check != null)
+			{
+				E5nModel cm = check.For(sessDate);
+				if (cm != null) d.Check = cm.Predict(x);
+				if (d.BaseTarget == 0 || double.IsNaN(d.Check) || d.Check * d.BaseTarget <= 0) d.Target = 0;
+			}
 			return d;
+		}
+	}
+
+	public sealed class E5nBand
+	{
+		public const int Look = 14, Gate = 4, Slots = 78;
+		public const double Chandelier = 3.0, A20 = 2.0 / 21.0, A50 = 2.0 / 51.0, A200 = 2.0 / 201.0;
+
+		readonly int warmup;
+		long bars5;
+		double e50, e200, atr, lastClose5;
+		bool hasBar;
+		DateTime barEnd;
+		double bo, bh, bl, bc, bv;
+		DateTime day = DateTime.MinValue;
+		bool dayOn, dayTrade, hasEma, hasEmaSnap;
+		int nb, dir, viol, pendTarget;
+		double o0, hi, lo, cumTpV, cumV, ema20, ema20Snap, dayLast, prevClose = double.NaN;
+		readonly double[][] hist = new double[Look][];
+		int histCount, histHead;
+		double[] cur = new double[Slots];
+		readonly double[] sg = new double[Slots];
+		bool pend, pendEntry;
+		double size, refPx, entryPx, ext, points, sides;
+
+		public int Target { get; private set; }
+		public int Days { get; private set; }
+		public long OvernightBars { get; private set; }
+		public bool TradingDay { get { return dayOn && dayTrade; } }
+		public bool DayClosed;
+		public DateTime ClosedDate;
+		public double ClosedPoints, ClosedSides;
+
+		public E5nBand(int warmupDays)
+		{
+			warmup = Math.Max(Look, warmupDays);
+			for (int i = 0; i < Look; i++) hist[i] = new double[Slots];
+		}
+
+		public int OnMinute(DateTime etEnd, double o, double h, double l, double c, double v)
+		{
+			long t = etEnd.Ticks / TimeSpan.TicksPerMinute;
+			DateTime end = new DateTime(((t + 4) / 5) * 5 * TimeSpan.TicksPerMinute);
+			if (hasBar && end != barEnd) { hasBar = false; OnFive(barEnd, bo, bh, bl, bc, bv); }
+			if (!hasBar) { hasBar = true; barEnd = end; bo = o; bh = h; bl = l; bc = c; bv = v; }
+			else { if (h > bh) bh = h; if (l < bl) bl = l; bc = c; bv += v; }
+			if (t % 5 == 0) { hasBar = false; OnFive(barEnd, bo, bh, bl, bc, bv); }
+			return Target;
+		}
+
+		public int OnFive(DateTime etEnd, double o, double h, double l, double c, double v)
+		{
+			double tr = bars5 == 0 ? h - l : Math.Max(h - l, Math.Max(Math.Abs(h - lastClose5), Math.Abs(l - lastClose5)));
+			if (bars5 == 0) { e50 = c; e200 = c; atr = tr; }
+			else
+			{
+				if (e50 != c) e50 = ((1.0 - A50) * e50 + A50 * c) / ((1.0 - A50) + A50);
+				if (e200 != c) e200 = ((1.0 - A200) * e200 + A200 * c) / ((1.0 - A200) + A200);
+				long k = Math.Min(bars5 + 1, 14);
+				atr = ((k - 1) * atr + tr) / k;
+			}
+			bars5++; lastClose5 = c;
+			if (pend) { Fill(pendTarget, o, pendEntry); pend = false; }
+			int m = etEnd.Hour * 60 + etEnd.Minute;
+			bool rth = m > 570 && m <= 960;
+			DateTime date = etEnd.Date;
+			if (!rth || date != day)
+			{
+				if (size != 0) Fill(0, o, false);
+				if (dayOn && dayTrade && !DayClosed && date != day) Close();
+				dir = 0; viol = 0; Target = 0;
+			}
+			if (!rth) { OvernightBars++; return Target; }
+			if (date != day)
+			{
+				Commit();
+				day = date; dayOn = m == 575; nb = 0;
+				if (!dayOn) return Target;
+				o0 = o; cumTpV = 0; cumV = 0; ema20Snap = ema20; hasEmaSnap = hasEma; points = 0; sides = 0; DayClosed = false;
+				for (int i = 0; i < Slots; i++) cur[i] = double.NaN;
+				dayTrade = Days >= warmup && !double.IsNaN(prevClose) && !E5nCalendar.IsShortDay(date);
+				if (dayTrade)
+				{
+					hi = Math.Max(o0, prevClose); lo = Math.Min(o0, prevClose);
+					for (int j = 0; j < Slots; j++)
+					{
+						double sum = 0; int cnt = 0;
+						for (int q = 0; q < Look; q++)
+						{
+							double x = hist[(histHead + q) % Look][j];
+							if (!double.IsNaN(x)) { sum += x; cnt++; }
+						}
+						sg[j] = cnt < 7 ? double.NaN : sum / cnt;
+					}
+				}
+			}
+			if (!dayOn) return Target;
+			int slot = (m - 575) / 5;
+			nb++; dayLast = c;
+			cur[slot] = Math.Abs(c / o0 - 1.0);
+			cumTpV += (h + l + c) / 3 * v; cumV += v;
+			double vw = cumTpV / Math.Max(cumV, 1.0);
+			ema20 = hasEma ? ema20 + A20 * (c - ema20) : c; hasEma = true;
+			if (!dayTrade) return Target;
+			if (m >= 960)
+			{
+				if (size != 0) Fill(0, c, false);
+				dir = 0; viol = 0; Target = 0; Close();
+				return Target;
+			}
+			double s = sg[slot];
+			bool has = !double.IsNaN(s);
+			double ub = hi * (1 + s), lb = lo * (1 - s);
+			if (dir != 0)
+			{
+				ext = dir > 0 ? Math.Max(ext, c) : Math.Min(ext, c);
+				if ((dir > 0 && c < ext - Chandelier * atr) || (dir < 0 && c > ext + Chandelier * atr)) { Decide(0); viol = 0; return Target; }
+			}
+			if (dir != 0 && has)
+			{
+				bool bad = dir > 0 ? c < Math.Max(ub, vw) : c > Math.Min(lb, vw);
+				viol = bad ? viol + 1 : 0;
+				if (viol >= Gate) { Decide(0); viol = 0; return Target; }
+			}
+			if (!has || m < 600 || m > 930 || m % 30 != 0) return Target;
+			int nw;
+			if (dir == 0)
+			{
+				nw = c > ub ? 1 : c < lb ? -1 : 0;
+				if (m == 720 || m == 750 || m == 780) nw = 0;
+			}
+			else nw = dir;
+			if (nw != 0 && nw != dir && ((nw == 1 && !(c > ema20)) || (nw == -1 && !(c < ema20)))) nw = 0;
+			if (nw != 0 && nw != dir && (e50 > e200 ? 1 : e50 < e200 ? -1 : 0) != nw) nw = 0;
+			if (nw != dir) Decide(nw);
+			return Target;
+		}
+
+		void Decide(int target)
+		{
+			pend = true; pendTarget = target; pendEntry = target != 0 && target != dir;
+			dir = target; Target = target;
+		}
+
+		void Fill(int target, double px, bool entry)
+		{
+			points += size * (px - refPx); sides += Math.Abs(target - size); size = target; refPx = px;
+			if (entry) { entryPx = px; ext = px; }
+		}
+
+		void Close()
+		{
+			DayClosed = true; ClosedDate = day; ClosedPoints = points; ClosedSides = sides;
+		}
+
+		void Commit()
+		{
+			if (!dayOn) return;
+			if (nb >= 30)
+			{
+				double[] slotRow = hist[histHead];
+				hist[histHead] = cur; cur = slotRow; histHead = (histHead + 1) % Look;
+				if (histCount < Look) histCount++;
+				prevClose = dayLast; Days++;
+			}
+			else { ema20 = ema20Snap; hasEma = hasEmaSnap; }
+			dayOn = false;
 		}
 	}
 }
