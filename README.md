@@ -78,6 +78,7 @@ continuous series.
 | Check model file | blank | Blank uses `Documents\NinjaTrader 8\e5n\e5n_models_15min.txt`. |
 | Write decision log | on | Every decision to `Documents\NinjaTrader 8\e5n\logs`. |
 | Write 1-minute bars | on | The bars the strategy sees, one file a day in `Documents\NinjaTrader 8\e5n\bars` (not in a backtest). |
+| Write ticks | on | Every trade with the bid, the ask and their sizes at that moment, one file a day in `Documents\NinjaTrader 8\e5n\ticks` (not in a backtest; written on a background thread, about 60 MB a day). |
 | Undo back-adjustment | on | See above. |
 
 ## Running live or on simulation

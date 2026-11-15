@@ -29,6 +29,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private DateTime[] rollDates = new DateTime[0];
 		private double[] rollOffsets = new double[0];
 		private readonly List<string> barBuf = new List<string>();
+		private const string TickHeader = "time_et,price,size,bid,ask,bid_size,ask_size";
+		private string ticksDir;
+		private System.Collections.Concurrent.ConcurrentQueue<string> tickQueue;
+		private System.Threading.Thread tickThread;
+		private volatile bool tickStop;
+		private double lastBid = double.NaN, lastAsk = double.NaN;
+		private long lastBidSize, lastAskSize, ticksWritten, tickErrors;
 
 		protected override void OnStateChange()
 		{
@@ -60,6 +67,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				CheckModelFile	= "";
 				WriteDecisions	= true;
 				WriteBars		= true;
+				WriteTicks		= true;
 				UndoBackAdjustment = true;
 			}
 			else if (State == State.DataLoaded)
@@ -147,6 +155,16 @@ namespace NinjaTrader.NinjaScript.Strategies
 							barsDir = Path.Combine(bars, inst + "_" + Instrument.Expiry.ToString("MM-yy", CI));
 							Directory.CreateDirectory(barsDir);
 						}
+						if (WriteTicks && !isBacktest)
+						{
+							ticksDir = Path.Combine(root, "ticks", inst + "_" + Instrument.Expiry.ToString("MM-yy", CI));
+							Directory.CreateDirectory(ticksDir);
+							tickQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+							tickThread = new System.Threading.Thread(TickWriter);
+							tickThread.IsBackground = true;
+							tickThread.Name = "E5nTicks";
+							tickThread.Start();
+						}
 					}
 				}
 				catch (Exception ex) { Print("E5nStrategy: cannot create log files: " + ex.Message); decisionLog = null; barsDir = null; }
@@ -162,6 +180,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				if (decisionLog != null) { try { decisionLog.Flush(); decisionLog.Dispose(); } catch { } decisionLog = null; }
 				if (!barLive) FlushBars();
+				if (tickThread != null) { tickStop = true; try { tickThread.Join(3000); } catch { } tickThread = null; }
 				if (liveSince != "")
 				{
 					LogEvent("terminated", string.Format(CI, "position {0} x{1}", Position.MarketPosition, Position.Quantity));
@@ -300,6 +319,50 @@ namespace NinjaTrader.NinjaScript.Strategies
 			catch (Exception ex) { Print("E5nStrategy: fill log write failed: " + ex.Message); }
 		}
 
+		protected override void OnMarketData(MarketDataEventArgs e)
+		{
+			if (tickQueue == null || State != State.Realtime || e == null) return;
+			if (e.MarketDataType == MarketDataType.Bid) { lastBid = e.Price; lastBidSize = e.Volume; return; }
+			if (e.MarketDataType == MarketDataType.Ask) { lastAsk = e.Price; lastAskSize = e.Volume; return; }
+			if (e.MarketDataType != MarketDataType.Last) return;
+			tickQueue.Enqueue(string.Format(CI, "{0:yyyy-MM-dd HH:mm:ss.fff},{1},{2},{3},{4},{5},{6}", ToEt(e.Time), e.Price, e.Volume, lastBid, lastAsk, lastBidSize, lastAskSize));
+		}
+
+		private void TickWriter()
+		{
+			string day = null; StreamWriter w = null; string line;
+			while (true)
+			{
+				bool any = false;
+				try
+				{
+					while (tickQueue.TryDequeue(out line))
+					{
+						any = true;
+						string d = line.Substring(0, 10);
+						if (d != day || w == null)
+						{
+							if (w != null) { w.Flush(); w.Dispose(); }
+							day = d; string path = Path.Combine(ticksDir, d + ".csv"); bool fresh = !File.Exists(path);
+							w = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), Encoding.ASCII);
+							if (fresh) w.WriteLine(TickHeader);
+						}
+						w.WriteLine(line); System.Threading.Interlocked.Increment(ref ticksWritten);
+					}
+					if (any && w != null) w.Flush();
+				}
+				catch (Exception)
+				{
+					System.Threading.Interlocked.Increment(ref tickErrors);
+					try { if (w != null) w.Dispose(); } catch { }
+					w = null;
+				}
+				if (tickStop && tickQueue.IsEmpty) break;
+				System.Threading.Thread.Sleep(250);
+			}
+			try { if (w != null) { w.Flush(); w.Dispose(); } } catch { }
+		}
+
 		private void LogBar(DateTime et, DateTime start, double o, double h, double l, double c, double v)
 		{
 			for (int i = 0; i < rollDates.Length; i++) if (rollDates[i] > start.Date) return;
@@ -403,6 +466,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 					engine != null ? engine.Threshold.ToString("R", CI) : "null", lastModel, engine != null ? engine.Sessions : 0, engine != null && engine.Warm ? "true" : "false",
 					band != null ? band.Days : 0, decisionsToday, Contracts, Check15 ? "true" : "false", BandContracts, bandOff ? "true" : "false", MaxDailyLoss,
 					(haltNote ?? "").Replace("\\", "/").Replace("\"", "'"), connected ? "true" : "false", liveSince);
+				json = json.Substring(0, json.Length - 1) + string.Format(CI, ",\"ticks_written\":{0},\"tick_errors\":{1},\"tick_queue\":{2}}}", System.Threading.Interlocked.Read(ref ticksWritten), System.Threading.Interlocked.Read(ref tickErrors), tickQueue != null ? tickQueue.Count : 0);
 				File.WriteAllText(statusPath, json);
 			}
 			catch (Exception ex) { Print("E5nStrategy: status write failed: " + ex.Message); }
@@ -418,7 +482,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[NinjaScriptProperty] [Display(Name = "Check model file (blank = default)", Description = "Blank uses <NinjaTrader 8 documents folder>\\e5n\\e5n_models_15min.txt.", GroupName = "1. E5n", Order = 7)] public string CheckModelFile { get; set; }
 		[NinjaScriptProperty] [Display(Name = "Write decision log", Description = "Every 5-minute decision to e5n\\logs (a backtest overwrites its own file).", GroupName = "1. E5n", Order = 8)] public bool WriteDecisions { get; set; }
 		[NinjaScriptProperty] [Display(Name = "Write 1-minute bars", Description = "The one-minute bars the strategy sees, one file a day in e5n\\bars, for the nightly forward ledger (not in a backtest).", GroupName = "1. E5n", Order = 9)] public bool WriteBars { get; set; }
-		[NinjaScriptProperty] [Display(Name = "Undo back-adjustment", Description = "With merge policy 'Merge back adjusted' NinjaTrader shifts older contracts' prices; the forecast models were trained on prices as traded, so the shift is removed with the instrument's rollover offsets. Leave on.", GroupName = "1. E5n", Order = 10)] public bool UndoBackAdjustment { get; set; }
+		[NinjaScriptProperty] [Display(Name = "Write ticks", Description = "Every trade with the bid, the ask and their sizes at that moment, one file a day in e5n\\ticks, for order-flow research (not in a backtest).", GroupName = "1. E5n", Order = 10)] public bool WriteTicks { get; set; }
+		[NinjaScriptProperty] [Display(Name = "Undo back-adjustment", Description = "With merge policy 'Merge back adjusted' NinjaTrader shifts older contracts' prices; the forecast models were trained on prices as traded, so the shift is removed with the instrument's rollover offsets. Leave on.", GroupName = "1. E5n", Order = 11)] public bool UndoBackAdjustment { get; set; }
 		#endregion
 	}
 }
