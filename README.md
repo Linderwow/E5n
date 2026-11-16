@@ -81,6 +81,25 @@ continuous series.
 | Write ticks | on | Every trade with the bid, the ask and their sizes at that moment, one file a day in `Documents\NinjaTrader 8\e5n\ticks` (not in a backtest; written on a background thread, about 60 MB a day). |
 | Undo back-adjustment | on | See above. |
 
+### Account (group "2. Account")
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| Account mode | Fixed | `Fixed`: the contract settings as they are. `Evaluation`: the contract settings until the account reaches start + target, then flat for good, so a passed evaluation is not given back. `Funded`: the contract settings times a number of units, set once a day at 09:30 ET from the cushion (see below). |
+| Account start balance | 50000 | The account's starting balance. |
+| Trailing drawdown | 2500 | How far the end-of-day threshold trails the highest end-of-day balance. |
+| Drawdown lock above start | 100 | The threshold stops trailing once it reaches start + this amount. |
+| Evaluation target | 3000 | Profit target. Evaluation mode only. |
+| Funded: cushion per unit | 2500 | Funded mode: units = balance above the threshold divided by this, rounded down, at least 1. |
+| Funded: max units | 4 | Funded mode: the most units at once. |
+| Highest end-of-day balance | 0 | Only for an account that traded before E5n ran on it: its highest end-of-day balance so far. 0 = E5n tracks it from the start (kept in `e5n\logs\E5n_account_*.json`). |
+
+The defaults are a 50K account with a $2,500 end-of-day trailing drawdown that locks at start + $100 and a $3,000 target;
+check them against your own account's rules. A unit is the two contract settings together: with 1 + 1 and 3 units the legs
+trade 3 + 3 micros. In a backtest the balance is the start balance plus the strategy's own profit. Live, it is the account's
+cash value; if NinjaTrader cannot read it, Funded stays at 1 unit and Evaluation does not watch the target (both logged).
+Every daily sizing is written to the event log.
+
 ## Running live or on simulation
 
 Give the strategy an account of its own. It refuses to start on an account where another strategy is already active.

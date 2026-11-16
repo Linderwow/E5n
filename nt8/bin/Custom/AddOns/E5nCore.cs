@@ -702,4 +702,35 @@ namespace E5nLib
 			dayOn = false;
 		}
 	}
+
+	public enum E5nAccountMode { Fixed, Evaluation, Funded }
+
+	public sealed class E5nSizer
+	{
+		public readonly E5nAccountMode Mode;
+		public readonly double Start, Drawdown, LockAbove, Target, PerUnit;
+		public readonly int MaxUnits;
+		public double High { get; private set; }
+
+		public E5nSizer(E5nAccountMode mode, double start, double drawdown, double lockAbove, double target, double perUnit, int maxUnits, double high)
+		{
+			Mode = mode; Start = start; Drawdown = drawdown; LockAbove = lockAbove; Target = target; PerUnit = perUnit; MaxUnits = Math.Max(1, maxUnits);
+			High = double.IsNaN(high) ? 0.0 : Math.Max(0.0, high);
+		}
+
+		public double Threshold { get { return Math.Min(High - Drawdown, LockAbove); } }
+
+		public double Cushion(double balance) { return balance - Start - Threshold; }
+
+		public void Close(double balance) { if (!double.IsNaN(balance) && !double.IsInfinity(balance)) High = Math.Max(High, balance - Start); }
+
+		public int Units(double balance)
+		{
+			if (Mode != E5nAccountMode.Funded || double.IsNaN(balance) || double.IsInfinity(balance) || PerUnit <= 0) return 1;
+			double u = Math.Floor(Cushion(balance) / PerUnit);
+			return u < 1 ? 1 : u > MaxUnits ? MaxUnits : (int)u;
+		}
+
+		public bool TargetReached(double equity) { return Mode == E5nAccountMode.Evaluation && !double.IsNaN(equity) && equity - Start >= Target; }
+	}
 }

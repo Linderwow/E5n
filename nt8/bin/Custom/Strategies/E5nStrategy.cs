@@ -36,6 +36,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private volatile bool tickStop;
 		private double lastBid = double.NaN, lastAsk = double.NaN;
 		private long lastBidSize, lastAskSize, ticksWritten, tickErrors;
+		private E5nSizer sizer;
+		private string accountPath;
+		private int units = 1;
+		private bool targetHit, sizedToday, closedToday, balanceWarned, liveAccount;
+		private double lastBalance = double.NaN;
 
 		protected override void OnStateChange()
 		{
@@ -69,6 +74,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 				WriteBars		= true;
 				WriteTicks		= true;
 				UndoBackAdjustment = true;
+				AccountMode		= E5nAccountMode.Fixed;
+				StartBalance	= 50000;
+				TrailingDrawdown = 2500;
+				LockAbove		= 100;
+				EvalTarget		= 3000;
+				CushionPerUnit	= 2500;
+				MaxUnits		= 4;
+				KnownHighBalance = 0;
 			}
 			else if (State == State.DataLoaded)
 			{
@@ -85,6 +98,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 						BarsPeriod == null ? "unknown" : BarsPeriod.Value.ToString(CI) + " " + BarsPeriod.BarsPeriodType);
 				else if (Contracts == 0 && BandContracts == 0)
 					blockNote = "both legs are set to 0 contracts - set 'Model-leg contracts' or 'Band-leg contracts' to 1 or more";
+				else if (AccountMode != E5nAccountMode.Fixed && (StartBalance <= 0 || TrailingDrawdown <= 0 || (AccountMode == E5nAccountMode.Evaluation && EvalTarget <= 0) || (AccountMode == E5nAccountMode.Funded && CushionPerUnit <= 0)))
+					blockNote = "account mode " + AccountMode + " needs 'Account start balance', 'Trailing drawdown' and " + (AccountMode == E5nAccountMode.Evaluation ? "'Evaluation target'" : "'Funded: cushion per unit'") + " above 0";
 				else if (!File.Exists(model))
 					blockNote = "model file not found: " + model + " - install it (see the README) or set 'Model file'";
 				else if (Check15 && !File.Exists(check))
@@ -126,6 +141,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 					eventsPath = Path.Combine(logDir, "E5n_events_" + tag + ".txt");
 					fillsPath = Path.Combine(logDir, "E5n_fills_" + tag + ".csv");
 					decisionsPath = Path.Combine(logDir, "E5n_decisions_" + tag + ".csv");
+					if (!isBacktest) accountPath = Path.Combine(logDir, "E5n_account_" + tag + ".json");
 					if (WriteDecisions)
 					{
 						string head = "date,time_et,minute,forecast,base_target,check,target,model,band,net,position,close,adjustment,sessions";
@@ -168,13 +184,20 @@ namespace NinjaTrader.NinjaScript.Strategies
 					}
 				}
 				catch (Exception ex) { Print("E5nStrategy: cannot create log files: " + ex.Message); decisionLog = null; barsDir = null; }
+				sizer = NewSizer(0.0);
 			}
 			else if (State == State.Transition)
 			{
 				working = 0;
 				liveSince = ToEt(DateTime.Now).ToString("yyyy-MM-dd HH:mm:ss", CI);
-				LogEvent("live", string.Format(CI, "model-leg contracts {0}, 15-minute check {1}, band-leg contracts {2}, warm-up sessions {3}, daily loss stop {4:0}, sessions in history {5}, band days {6}, start {7}, on error {8}",
-					Contracts, Check15 ? "on" : "off", BandContracts, WarmupSessions, MaxDailyLoss, engine != null ? engine.Sessions : 0, band != null ? band.Days : 0, StartBehavior, RealtimeErrorHandling));
+				LogEvent("live", string.Format(CI, "model-leg contracts {0}, 15-minute check {1}, band-leg contracts {2}, warm-up sessions {3}, daily loss stop {4:0}, sessions in history {5}, band days {6}, start {7}, on error {8}, account mode {9}",
+					Contracts, Check15 ? "on" : "off", BandContracts, WarmupSessions, MaxDailyLoss, engine != null ? engine.Sessions : 0, band != null ? band.Days : 0, StartBehavior, RealtimeErrorHandling, AccountText()));
+			}
+			else if (State == State.Realtime)
+			{
+				targetHit = false; units = 1; lastBalance = double.NaN; sizedToday = false; closedToday = false;
+				liveAccount = !isBacktest && AccountMode != E5nAccountMode.Fixed;
+				sizer = NewSizer(liveAccount ? ReadHigh() : 0.0);
 			}
 			else if (State == State.Terminated)
 			{
@@ -210,7 +233,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			DateTime start = et.AddMinutes(-1);
 			if (start.Date != dayKey)
 			{
-				dayKey = start.Date; halted = false; haltNote = ""; decisionsToday = 0; legModel = 0;
+				dayKey = start.Date; halted = false; haltNote = ""; decisionsToday = 0; legModel = 0; sizedToday = false; closedToday = false;
 				dayStartRealized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
 			}
 			int cur = Position.MarketPosition == MarketPosition.Long ? Position.Quantity : Position.MarketPosition == MarketPosition.Short ? -Position.Quantity : 0;
@@ -250,7 +273,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 			int m = start.Hour * 60 + start.Minute;
 			if (m >= 959 || m < 570) legModel = 0;
-			int want = halted || m >= 959 || m < 570 ? 0 : legModel * Contracts + legBand * BandContracts;
+			if (AccountMode != E5nAccountMode.Fixed && sizer != null) UpdateAccount(m, cur);
+			int want = halted || targetHit || m >= 959 || m < 570 ? 0 : (legModel * Contracts + legBand * BandContracts) * units;
 			lastNet = want;
 			if (working > 0 && CurrentBar - workingBar >= 2)
 			{
@@ -271,6 +295,100 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 			if (barsDir != null) LogBar(et, start, Open[0] - adj, High[0] - adj, Low[0] - adj, Close[0] - adj, Volume[0]);
 			if (State == State.Realtime && (d != null || m >= 959)) WriteStatus(halted ? "halted" : "running");
+		}
+
+		private void UpdateAccount(int m, int cur)
+		{
+			if (!closedToday && m >= 965 && cur == 0)
+			{
+				closedToday = true; double b = Balance(); sizer.Close(b);
+				if (liveAccount) WriteHigh();
+			}
+			if (!sizedToday && m >= 570)
+			{
+				sizedToday = true; double b = Balance(); lastBalance = b; sizer.Close(b); units = sizer.Units(b);
+				if (sizer.TargetReached(b)) targetHit = true;
+				if (liveAccount) WriteHigh();
+				LogEvent("sizing", string.Format(CI, "mode {0}, balance {1}, highest close {2:0.00}, threshold {3:0.00}, cushion {4}, units {5} (model {6}, band {7}){8}", AccountMode,
+					double.IsNaN(b) ? "unknown" : b.ToString("0.00", CI), StartBalance + sizer.High, StartBalance + sizer.Threshold, double.IsNaN(b) ? "unknown" : sizer.Cushion(b).ToString("0.00", CI),
+					units, Contracts * units, BandContracts * units, targetHit ? ", evaluation target already reached - flat" : ""));
+			}
+			if (AccountMode == E5nAccountMode.Evaluation && !targetHit)
+			{
+				double b = Balance(); double eq = b + (cur != 0 ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency, Close[0]) : 0.0);
+				if (!double.IsNaN(b)) lastBalance = b;
+				if (sizer.TargetReached(eq))
+				{
+					targetHit = true;
+					string note = string.Format(CI, "evaluation target reached: equity {0:0.00} >= start {1:0} + target {2:0} - flat and no more trades on this account", eq, StartBalance, EvalTarget);
+					Print("E5nStrategy: " + note);
+					LogEvent("evaluation_target", note);
+				}
+			}
+		}
+
+		private E5nSizer NewSizer(double high)
+		{
+			return new E5nSizer(AccountMode, StartBalance, TrailingDrawdown, LockAbove, EvalTarget, CushionPerUnit, MaxUnits, Math.Max(high, KnownHighBalance > 0 ? KnownHighBalance - StartBalance : 0.0));
+		}
+
+		private double Balance()
+		{
+			if (State == State.Realtime && !isBacktest)
+			{
+				double v = double.NaN;
+				try { if (Account != null) v = Account.Get(AccountItem.CashValue, Currency.UsDollar); } catch { v = double.NaN; }
+				if (v > 0) return v;
+				if (!balanceWarned) { balanceWarned = true; LogEvent("balance_missing", "the account's cash value is not available - funded sizing stays at 1 unit and the evaluation target is not watched", true); }
+				return double.NaN;
+			}
+			return StartBalance + SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+		}
+
+		private static double Num(string s, string key)
+		{
+			int i = s.IndexOf("\"" + key + "\":", StringComparison.Ordinal);
+			if (i < 0) return double.NaN;
+			i += key.Length + 3; int j = i;
+			while (j < s.Length && "0123456789.-+Ee".IndexOf(s[j]) >= 0) j++;
+			double v;
+			return double.TryParse(s.Substring(i, j - i), NumberStyles.Float, CI, out v) ? v : double.NaN;
+		}
+
+		private double ReadHigh()
+		{
+			try
+			{
+				if (accountPath == null || !File.Exists(accountPath)) return 0.0;
+				string s = File.ReadAllText(accountPath);
+				double st = Num(s, "start_balance"), hb = Num(s, "high_balance");
+				if (double.IsNaN(st) || double.IsNaN(hb)) return 0.0;
+				if (Math.Abs(st - StartBalance) > 0.005)
+				{
+					LogEvent("account_state", string.Format(CI, "saved state is for start balance {0:0} - ignored, tracking from now with {1:0}", st, StartBalance), true);
+					return 0.0;
+				}
+				return hb - StartBalance;
+			}
+			catch (Exception ex) { Print("E5nStrategy: account state not read: " + ex.Message); return 0.0; }
+		}
+
+		private void WriteHigh()
+		{
+			if (accountPath == null || sizer == null) return;
+			try
+			{
+				File.WriteAllText(accountPath, string.Format(CI, "{{\"mode\":\"{0}\",\"start_balance\":{1},\"high_balance\":{2},\"updated_et\":\"{3:yyyy-MM-dd HH:mm:ss}\"}}",
+					AccountMode, StartBalance.ToString("R", CI), (StartBalance + sizer.High).ToString("R", CI), ToEt(DateTime.Now)));
+			}
+			catch (Exception ex) { Print("E5nStrategy: account state write failed: " + ex.Message); }
+		}
+
+		private string AccountText()
+		{
+			if (AccountMode == E5nAccountMode.Fixed) return "Fixed";
+			if (AccountMode == E5nAccountMode.Evaluation) return string.Format(CI, "Evaluation (start {0:0}, target {1:0})", StartBalance, EvalTarget);
+			return string.Format(CI, "Funded (start {0:0}, drawdown {1:0}, lock {2:0}, cushion per unit {3:0}, max units {4}, known high {5:0})", StartBalance, TrailingDrawdown, LockAbove, CushionPerUnit, MaxUnits, KnownHighBalance);
 		}
 
 		private void Trade(int cur, int want)
@@ -467,6 +585,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 					band != null ? band.Days : 0, decisionsToday, Contracts, Check15 ? "true" : "false", BandContracts, bandOff ? "true" : "false", MaxDailyLoss,
 					(haltNote ?? "").Replace("\\", "/").Replace("\"", "'"), connected ? "true" : "false", liveSince);
 				json = json.Substring(0, json.Length - 1) + string.Format(CI, ",\"ticks_written\":{0},\"tick_errors\":{1},\"tick_queue\":{2}}}", System.Threading.Interlocked.Read(ref ticksWritten), System.Threading.Interlocked.Read(ref tickErrors), tickQueue != null ? tickQueue.Count : 0);
+				bool sized = sizer != null && AccountMode != E5nAccountMode.Fixed;
+				json = json.Substring(0, json.Length - 1) + string.Format(CI, ",\"account_mode\":\"{0}\",\"units\":{1},\"balance\":{2},\"threshold_balance\":{3},\"cushion\":{4},\"target_reached\":{5}}}", AccountMode, units,
+					sized && !double.IsNaN(lastBalance) ? lastBalance.ToString("0.00", CI) : "null", sized ? (StartBalance + sizer.Threshold).ToString("0.00", CI) : "null",
+					sized && !double.IsNaN(lastBalance) ? sizer.Cushion(lastBalance).ToString("0.00", CI) : "null", targetHit ? "true" : "false");
 				File.WriteAllText(statusPath, json);
 			}
 			catch (Exception ex) { Print("E5nStrategy: status write failed: " + ex.Message); }
@@ -484,6 +606,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[NinjaScriptProperty] [Display(Name = "Write 1-minute bars", Description = "The one-minute bars the strategy sees, one file a day in e5n\\bars, for the nightly forward ledger (not in a backtest).", GroupName = "1. E5n", Order = 9)] public bool WriteBars { get; set; }
 		[NinjaScriptProperty] [Display(Name = "Write ticks", Description = "Every trade with the bid, the ask and their sizes at that moment, one file a day in e5n\\ticks, for order-flow research (not in a backtest).", GroupName = "1. E5n", Order = 10)] public bool WriteTicks { get; set; }
 		[NinjaScriptProperty] [Display(Name = "Undo back-adjustment", Description = "With merge policy 'Merge back adjusted' NinjaTrader shifts older contracts' prices; the forecast models were trained on prices as traded, so the shift is removed with the instrument's rollover offsets. Leave on.", GroupName = "1. E5n", Order = 11)] public bool UndoBackAdjustment { get; set; }
+		[NinjaScriptProperty] [Display(Name = "Account mode", Description = "Fixed = the contract settings as they are. Evaluation = the contract settings until the account reaches start + target, then flat for good (the pass is kept). Funded = the contract settings times units: 1 unit per 'cushion per unit' of balance above the trailing-drawdown threshold, at least 1 and at most 'max units', set once a day at 09:30 ET.", GroupName = "2. Account", Order = 1)] public E5nAccountMode AccountMode { get; set; }
+		[NinjaScriptProperty] [Range(0, 10000000)] [Display(Name = "Account start balance ($)", Description = "The account's starting balance (Bulenox 50K: 50000).", GroupName = "2. Account", Order = 2)] public double StartBalance { get; set; }
+		[NinjaScriptProperty] [Range(0, 1000000)] [Display(Name = "Trailing drawdown ($)", Description = "How far the end-of-day threshold trails the highest end-of-day balance (Bulenox 50K: 2500).", GroupName = "2. Account", Order = 3)] public double TrailingDrawdown { get; set; }
+		[NinjaScriptProperty] [Range(-1000000, 1000000)] [Display(Name = "Drawdown lock above start ($)", Description = "The threshold stops trailing once it reaches start + this amount (Bulenox: 100).", GroupName = "2. Account", Order = 4)] public double LockAbove { get; set; }
+		[NinjaScriptProperty] [Range(0, 1000000)] [Display(Name = "Evaluation target ($)", Description = "Profit target of the evaluation (Bulenox 50K: 3000). Evaluation mode only.", GroupName = "2. Account", Order = 5)] public double EvalTarget { get; set; }
+		[NinjaScriptProperty] [Range(0, 1000000)] [Display(Name = "Funded: cushion per unit ($)", Description = "Balance above the threshold needed for each unit (as tested: 2500). Funded mode only.", GroupName = "2. Account", Order = 6)] public double CushionPerUnit { get; set; }
+		[NinjaScriptProperty] [Range(1, 20)] [Display(Name = "Funded: max units", Description = "Most units at once (as tested: 4). Funded mode only.", GroupName = "2. Account", Order = 7)] public int MaxUnits { get; set; }
+		[NinjaScriptProperty] [Range(0, 10000000)] [Display(Name = "Highest end-of-day balance ($, 0 = tracked)", Description = "Only if the account traded before E5n ran on it: its highest end-of-day balance so far, from the statement. E5n keeps track from then on in e5n\\logs\\E5n_account_*.json.", GroupName = "2. Account", Order = 8)] public double KnownHighBalance { get; set; }
 		#endregion
 	}
 }
