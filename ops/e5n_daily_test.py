@@ -228,6 +228,10 @@ import json as _j
 check('T39 checkpoint result is plain JSON (no numpy values)', isinstance(n1, int) and bool(_j.dumps(CK2.ledger(pd.DataFrame({'book_usd': [10.0, -5.0], 'model_usd': [1.0, 2.0]})))))
 check('T38 dry-spell gauge: sessions since the last high, graded normal / long / longer than ever', n1 == 2 and 'normal' in s1_ and n2 == 40 and 'long but seen' in s2_ and n3 == 260 and 'LONGER' in s3_ and n4 == 0,
       str((n1, s1_, n2, n3, n4)))
+mt9 = marks_t.assign(atr=1.0); b9 = TGT.bracket(cont_t, mt9).iloc[0]
+b9s = TGT.bracket(cont_t.assign(o=200.0 - cont_t.o, h=200.0 - cont_t.h, l=200.0 - cont_t.l, c=200.0 - cont_t.c), mt9).iloc[0]
+check('T41 band bracket shadow: a short running 6+ points in its favour leaves at the next minute after +6 ATR; one running 2 points against it leaves after -2 ATR',
+      b9.trades == 1 and b9.hits == 1 and abs(b9.diff_pts - (95.0 - 93.0)) < 1e-9 and b9s.hits == 1 and abs(b9s.diff_pts - ((200 - 95.0) - (200 - 97.0))) < 1e-9, str((b9.values.tolist(), b9s.values.tolist())))
 d8 = tempfile.mkdtemp()
 try:
     os.makedirs(os.path.join(d8, 'log'))

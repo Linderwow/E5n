@@ -43,13 +43,49 @@ def shadow(cont, marks, k=K):
     return pd.DataFrame(rows, columns=['date', 'trades', 'hits', 'diff_pts'])
 
 
-def append_ledger(sh, start, now):
-    old = pd.read_csv(LEDGER) if os.path.exists(LEDGER) else pd.DataFrame(columns=COLS)
+def bracket(cont, marks, stop=2.0, tgt=6.0):
+    end = pd.DatetimeIndex(cont.end); dec = ((end.hour * 60 + end.minute) - 571).values; dayv = end.normalize().values
+    o = cont.o.values.astype(float); c = cont.c.values.astype(float); rth = (dec >= 0) & (dec <= 389)
+    minute = {}
+    for d_, k_, o_, c_ in zip(dayv[rth], dec[rth], o[rth], c[rth]): minute.setdefault(d_, {})[int(k_)] = (o_, c_)
+    mk = marks.sort_values('time'); t = pd.DatetimeIndex(mk.time); mk = mk.assign(day=t.normalize().values, dec0=((t.hour * 60 + t.minute) - 570).values)
+    rows = []
+    for d_, g in mk.groupby('day', sort=True):
+        g = g[(g.dec0 >= 15) & (g.dec0 <= 385)]; px = minute.get(np.datetime64(d_), {})
+        if not len(g) or not px: continue
+        tg = g.target.values.astype(float); d0 = g.dec0.values.astype(int); A = g.atr.values.astype(float)
+        close16 = px[max(px)][1]; n = len(tg); i = 0; diff = 0.0; hits = 0; trades = 0
+        while i < n:
+            if tg[i] == 0 or (i > 0 and tg[i] == tg[i - 1]): i += 1; continue
+            j = i + 1
+            while j < n and tg[j] == tg[i]: j += 1
+            x = int(d0[j]) if j < n else None; s = float(np.sign(tg[i])); e = int(d0[i]); W = A[i]; trades += 1
+            if e in px and W == W and W > 0:
+                ent = px[e][0]; last = min(x - 1 if x is not None else LAST_CHECK, LAST_CHECK)
+                for m in range(e + 1, last + 1):
+                    if m not in px: continue
+                    op = s * (px[m][0] - ent)
+                    if -stop * W < op < tgt * W: continue
+                    if m + 1 in px and (x is None or m + 1 < x):
+                        base_exit = px[x][0] if x is not None and x in px else close16
+                        diff += s * (px[m + 1][0] - base_exit) * abs(tg[i]); hits += 1
+                    break
+            i = j
+        rows.append((pd.Timestamp(d_).date(), trades, hits, round(diff, 2)))
+    return pd.DataFrame(rows, columns=['date', 'trades', 'hits', 'diff_pts'])
+
+
+LEDGER_BR = os.path.join(HERE, 'data', 'e5n_shadow_bracket.csv')
+
+
+def append_ledger(sh, start, now, ledger=None):
+    LEDGER_ = ledger or LEDGER
+    old = pd.read_csv(LEDGER_) if os.path.exists(LEDGER_) else pd.DataFrame(columns=COLS)
     have = set(pd.to_datetime(old.date).dt.date); new = sh[(pd.to_datetime(sh.date) > start) & ~sh.date.isin(have)]
     if len(new):
         new = new.assign(diff_usd=(new.diff_pts * USD_PT).round(2), recorded=now.strftime('%Y-%m-%d %H:%M'))[COLS]
-        new.to_csv(LEDGER, mode='a', header=not os.path.exists(LEDGER), index=False)
-    return (pd.read_csv(LEDGER) if os.path.exists(LEDGER) else old), int(len(new))
+        new.to_csv(LEDGER_, mode='a', header=not os.path.exists(LEDGER_), index=False)
+    return (pd.read_csv(LEDGER_) if os.path.exists(LEDGER_) else old), int(len(new))
 
 
 def summary(L):

@@ -294,6 +294,10 @@ def main():
     try:
         TS, tadded = TGT.append_ledger(TGT.shadow(cont[cont.end > TRAIN_END], marks[marks.time > TRAIN_END]), TRAIN_END, now); target = dict(TGT.summary(TS), added=tadded)
     except Exception as e: target = dict(error=f"{type(e).__name__}: {e}")
+    try:
+        BS, badded = TGT.append_ledger(TGT.bracket(cont[cont.end > TRAIN_END], marks[marks.time > TRAIN_END]), TRAIN_END, now, TGT.LEDGER_BR)
+        bracket_sh = dict(TGT.summary(BS), added=badded)
+    except Exception as e: bracket_sh = dict(error=f"{type(e).__name__}: {e}")
     restated = []
     for r_ in L.itertuples() if len(L) else []:
         d_ = pd.Timestamp(r_.date).date()
@@ -320,7 +324,8 @@ def main():
     if big: health['warnings'].append(f"ledger day(s) recorded with different bars than today's: " + ', '.join(f"{d} ${a:+,.0f} -> ${b:+,.0f}" for d, a, b in big[:5]))
     summary = (f"Forward test: {ck_ledger.get('sessions', 0)} sessions, book ${ck_ledger.get('book_usd', 0):+,.0f} (fair median ${ck_ledger.get('book_median', 0):+,.0f}, "
                f"stop line ${ck_ledger.get('book_p5', 0):+,.0f}) - {ck_ledger.get('status')}; {ck_ledger.get('checkpoint', '')}; {ck_ledger.get('dry_spell', '')}. Stock shadow: {ck_shadow.get('status')}. "
-               f"Order flow: {flow.get('verdict', flow.get('error', ''))}. Band profit target (shadow, not traded): {target.get('status', target.get('error', 'no sessions yet'))}.")
+               f"Order flow: {flow.get('verdict', flow.get('error', ''))}. Band profit target (shadow, not traded): {target.get('status', target.get('error', 'no sessions yet'))}. "
+               f"Band 2-ATR stop + 6-ATR target (shadow, not traded): {bracket_sh.get('status', bracket_sh.get('error', 'no sessions yet'))}.")
     health['summary'] = summary
     if target.get('error'): health['warnings'].append(f"band target shadow not updated: {target['error']}")
     elif str(target.get('status', '')).startswith(('DROPPED', 'CANDIDATE', 'NOT ADOPTED')): health['warnings'].append(f"band target shadow: {target['status']}")
@@ -350,7 +355,7 @@ def main():
                   csharp_band=dict(days_compared=bcmp, identical=bsame) if cb is not None else None, roll_offsets=[[str(pd.Timestamp(d).date()), o] for d, o in offs[-4:]],
                   own_bar_files=len(own), own_bars_last=os.path.basename(own[-1])[:-4] if own else '', models_installed=installed,
                   strategy_decision_logs=logs, strategy_status=st, health=health, stock_shadow=shadow, checkpoints=dict(ledger=ck_ledger, shadow=ck_shadow, order_flow=flow),
-                  ledger_restated=restated, target_shadow=target, refit=RF.jload(RF.STATUS, {}), warnings=health['warnings'], problems=problems)
+                  ledger_restated=restated, target_shadow=target, bracket_shadow=bracket_sh, refit=RF.jload(RF.STATUS, {}), warnings=health['warnings'], problems=problems)
     text = json.dumps(status, indent=1, default=lambda o: o.item() if hasattr(o, 'item') else str(o))
     tmp = STATUS + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as fh: fh.write(text)
