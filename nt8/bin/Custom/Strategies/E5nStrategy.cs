@@ -30,12 +30,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private double[] rollOffsets = new double[0];
 		private readonly List<string> barBuf = new List<string>();
 		private const string TickHeader = "time_et,price,size,bid,ask,bid_size,ask_size";
-		private string ticksDir;
-		private System.Collections.Concurrent.ConcurrentQueue<string> tickQueue;
-		private System.Threading.Thread tickThread;
-		private volatile bool tickStop;
+		private const string DepthHeader = "time_et,side,op,level,price,size";
+		private LineWriter tickW, depthW;
 		private double lastBid = double.NaN, lastAsk = double.NaN;
-		private long lastBidSize, lastAskSize, ticksWritten, tickErrors;
+		private long lastBidSize, lastAskSize;
 		private E5nSizer sizer;
 		private string accountPath;
 		private int units = 1;
@@ -73,6 +71,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				WriteDecisions	= true;
 				WriteBars		= true;
 				WriteTicks		= true;
+				WriteDepth		= true;
 				UndoBackAdjustment = true;
 				AccountMode		= E5nAccountMode.Fixed;
 				StartBalance	= 50000;
@@ -171,16 +170,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 							barsDir = Path.Combine(bars, inst + "_" + Instrument.Expiry.ToString("MM-yy", CI));
 							Directory.CreateDirectory(barsDir);
 						}
-						if (WriteTicks && !isBacktest)
-						{
-							ticksDir = Path.Combine(root, "ticks", inst + "_" + Instrument.Expiry.ToString("MM-yy", CI));
-							Directory.CreateDirectory(ticksDir);
-							tickQueue = new System.Collections.Concurrent.ConcurrentQueue<string>();
-							tickThread = new System.Threading.Thread(TickWriter);
-							tickThread.IsBackground = true;
-							tickThread.Name = "E5nTicks";
-							tickThread.Start();
-						}
+						string contract = inst + "_" + Instrument.Expiry.ToString("MM-yy", CI);
+						if (WriteTicks && !isBacktest) tickW = new LineWriter(Path.Combine(root, "ticks", contract), TickHeader, "E5nTicks");
+						if (WriteDepth && !isBacktest) depthW = new LineWriter(Path.Combine(root, "depth", contract), DepthHeader, "E5nDepth");
 					}
 				}
 				catch (Exception ex) { Print("E5nStrategy: cannot create log files: " + ex.Message); decisionLog = null; barsDir = null; }
@@ -203,7 +195,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 			{
 				if (decisionLog != null) { try { decisionLog.Flush(); decisionLog.Dispose(); } catch { } decisionLog = null; }
 				if (!barLive) FlushBars();
-				if (tickThread != null) { tickStop = true; try { tickThread.Join(3000); } catch { } tickThread = null; }
+				if (tickW != null) { tickW.Close(); tickW = null; }
+				if (depthW != null) { depthW.Close(); depthW = null; }
 				if (liveSince != "")
 				{
 					LogEvent("terminated", string.Format(CI, "position {0} x{1}", Position.MarketPosition, Position.Quantity));
@@ -439,46 +432,80 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 		protected override void OnMarketData(MarketDataEventArgs e)
 		{
-			if (tickQueue == null || State != State.Realtime || e == null) return;
+			if (tickW == null || State != State.Realtime || e == null) return;
 			if (e.MarketDataType == MarketDataType.Bid) { lastBid = e.Price; lastBidSize = e.Volume; return; }
 			if (e.MarketDataType == MarketDataType.Ask) { lastAsk = e.Price; lastAskSize = e.Volume; return; }
 			if (e.MarketDataType != MarketDataType.Last) return;
-			tickQueue.Enqueue(string.Format(CI, "{0:yyyy-MM-dd HH:mm:ss.fff},{1},{2},{3},{4},{5},{6}", ToEt(e.Time), e.Price, e.Volume, lastBid, lastAsk, lastBidSize, lastAskSize));
+			tickW.Queue.Enqueue(string.Format(CI, "{0:yyyy-MM-dd HH:mm:ss.fff},{1},{2},{3},{4},{5},{6}", ToEt(e.Time), e.Price, e.Volume, lastBid, lastAsk, lastBidSize, lastAskSize));
 		}
 
-		private void TickWriter()
+		protected override void OnMarketDepth(MarketDepthEventArgs e)
 		{
-			string day = null; StreamWriter w = null; string line;
-			while (true)
+			if (depthW == null || State != State.Realtime || e == null) return;
+			string side = e.MarketDataType == MarketDataType.Bid ? "B" : e.MarketDataType == MarketDataType.Ask ? "A" : null;
+			if (side == null) return;
+			string op = e.Operation == Operation.Add ? "A" : e.Operation == Operation.Update ? "U" : "R";
+			depthW.Queue.Enqueue(string.Format(CI, "{0:yyyy-MM-dd HH:mm:ss.fff},{1},{2},{3},{4},{5}", ToEt(e.Time), side, op, e.Position, e.Price, e.Volume));
+		}
+
+		private sealed class LineWriter
+		{
+			public readonly System.Collections.Concurrent.ConcurrentQueue<string> Queue = new System.Collections.Concurrent.ConcurrentQueue<string>();
+			public long Written, Errors;
+			private volatile bool stop;
+			private readonly string dir, header;
+			private readonly System.Threading.Thread thread;
+
+			public LineWriter(string dir, string header, string name)
 			{
-				bool any = false;
-				try
-				{
-					while (tickQueue.TryDequeue(out line))
-					{
-						any = true;
-						string d = line.Substring(0, 10);
-						if (d != day || w == null)
-						{
-							if (w != null) { w.Flush(); w.Dispose(); }
-							day = d; string path = Path.Combine(ticksDir, d + ".csv"); bool fresh = !File.Exists(path);
-							w = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), Encoding.ASCII);
-							if (fresh) w.WriteLine(TickHeader);
-						}
-						w.WriteLine(line); System.Threading.Interlocked.Increment(ref ticksWritten);
-					}
-					if (any && w != null) w.Flush();
-				}
-				catch (Exception)
-				{
-					System.Threading.Interlocked.Increment(ref tickErrors);
-					try { if (w != null) w.Dispose(); } catch { }
-					w = null;
-				}
-				if (tickStop && tickQueue.IsEmpty) break;
-				System.Threading.Thread.Sleep(250);
+				this.dir = dir; this.header = header;
+				Directory.CreateDirectory(dir);
+				thread = new System.Threading.Thread(Run);
+				thread.IsBackground = true;
+				thread.Name = name;
+				thread.Start();
 			}
-			try { if (w != null) { w.Flush(); w.Dispose(); } } catch { }
+
+			public void Close()
+			{
+				stop = true;
+				try { thread.Join(3000); } catch { }
+			}
+
+			private void Run()
+			{
+				string day = null; StreamWriter w = null; string line;
+				while (true)
+				{
+					bool any = false;
+					try
+					{
+						while (Queue.TryDequeue(out line))
+						{
+							any = true;
+							string d = line.Substring(0, 10);
+							if (d != day || w == null)
+							{
+								if (w != null) { w.Flush(); w.Dispose(); }
+								day = d; string path = Path.Combine(dir, d + ".csv"); bool fresh = !File.Exists(path);
+								w = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), Encoding.ASCII);
+								if (fresh) w.WriteLine(header);
+							}
+							w.WriteLine(line); System.Threading.Interlocked.Increment(ref Written);
+						}
+						if (any && w != null) w.Flush();
+					}
+					catch (Exception)
+					{
+						System.Threading.Interlocked.Increment(ref Errors);
+						try { if (w != null) w.Dispose(); } catch { }
+						w = null;
+					}
+					if (stop && Queue.IsEmpty) break;
+					System.Threading.Thread.Sleep(250);
+				}
+				try { if (w != null) { w.Flush(); w.Dispose(); } } catch { }
+			}
 		}
 
 		private void LogBar(DateTime et, DateTime start, double o, double h, double l, double c, double v)
@@ -584,7 +611,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 					engine != null ? engine.Threshold.ToString("R", CI) : "null", lastModel, engine != null ? engine.Sessions : 0, engine != null && engine.Warm ? "true" : "false",
 					band != null ? band.Days : 0, decisionsToday, Contracts, Check15 ? "true" : "false", BandContracts, bandOff ? "true" : "false", MaxDailyLoss,
 					(haltNote ?? "").Replace("\\", "/").Replace("\"", "'"), connected ? "true" : "false", liveSince);
-				json = json.Substring(0, json.Length - 1) + string.Format(CI, ",\"ticks_written\":{0},\"tick_errors\":{1},\"tick_queue\":{2}}}", System.Threading.Interlocked.Read(ref ticksWritten), System.Threading.Interlocked.Read(ref tickErrors), tickQueue != null ? tickQueue.Count : 0);
+				LineWriter tw = tickW, dw = depthW;
+				json = json.Substring(0, json.Length - 1) + string.Format(CI, ",\"ticks_written\":{0},\"tick_errors\":{1},\"tick_queue\":{2},\"depth_written\":{3},\"depth_errors\":{4},\"depth_queue\":{5}}}",
+					tw != null ? System.Threading.Interlocked.Read(ref tw.Written) : 0, tw != null ? System.Threading.Interlocked.Read(ref tw.Errors) : 0, tw != null ? tw.Queue.Count : 0,
+					dw != null ? System.Threading.Interlocked.Read(ref dw.Written) : 0, dw != null ? System.Threading.Interlocked.Read(ref dw.Errors) : 0, dw != null ? dw.Queue.Count : 0);
 				bool sized = sizer != null && AccountMode != E5nAccountMode.Fixed;
 				json = json.Substring(0, json.Length - 1) + string.Format(CI, ",\"account_mode\":\"{0}\",\"units\":{1},\"balance\":{2},\"threshold_balance\":{3},\"cushion\":{4},\"target_reached\":{5}}}", AccountMode, units,
 					sized && !double.IsNaN(lastBalance) ? lastBalance.ToString("0.00", CI) : "null", sized ? (StartBalance + sizer.Threshold).ToString("0.00", CI) : "null",
@@ -605,6 +635,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[NinjaScriptProperty] [Display(Name = "Write decision log", Description = "Every 5-minute decision to e5n\\logs (a backtest overwrites its own file).", GroupName = "1. E5n", Order = 8)] public bool WriteDecisions { get; set; }
 		[NinjaScriptProperty] [Display(Name = "Write 1-minute bars", Description = "The one-minute bars the strategy sees, one file a day in e5n\\bars, for the nightly forward ledger (not in a backtest).", GroupName = "1. E5n", Order = 9)] public bool WriteBars { get; set; }
 		[NinjaScriptProperty] [Display(Name = "Write ticks", Description = "Every trade with the bid, the ask and their sizes at that moment, one file a day in e5n\\ticks, for order-flow research (not in a backtest).", GroupName = "1. E5n", Order = 10)] public bool WriteTicks { get; set; }
+		[NinjaScriptProperty] [Display(Name = "Write order book", Description = "Every change of the 10-level order book (side, add / update / remove, level, price, size), one file a day in e5n\\depth, for order-book research (not in a backtest).", GroupName = "1. E5n", Order = 12)] public bool WriteDepth { get; set; }
 		[NinjaScriptProperty] [Display(Name = "Undo back-adjustment", Description = "With merge policy 'Merge back adjusted' NinjaTrader shifts older contracts' prices; the forecast models were trained on prices as traded, so the shift is removed with the instrument's rollover offsets. Leave on.", GroupName = "1. E5n", Order = 11)] public bool UndoBackAdjustment { get; set; }
 		[NinjaScriptProperty] [Display(Name = "Account mode", Description = "Fixed = the contract settings as they are. Evaluation = the contract settings until the account reaches start + target, then flat for good (the pass is kept). Funded = the contract settings times units: 1 unit per 'cushion per unit' of balance above the trailing-drawdown threshold, at least 1 and at most 'max units', set once a day at 09:30 ET.", GroupName = "2. Account", Order = 1)] public E5nAccountMode AccountMode { get; set; }
 		[NinjaScriptProperty] [Range(0, 10000000)] [Display(Name = "Account start balance ($)", Description = "The account's starting balance (Bulenox 50K: 50000).", GroupName = "2. Account", Order = 2)] public double StartBalance { get; set; }

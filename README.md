@@ -80,6 +80,7 @@ continuous series.
 | Write 1-minute bars | on | The bars the strategy sees, one file a day in `Documents\NinjaTrader 8\e5n\bars` (not in a backtest). |
 | Write ticks | on | Every trade with the bid, the ask and their sizes at that moment, one file a day in `Documents\NinjaTrader 8\e5n\ticks` (not in a backtest; written on a background thread, about 60 MB a day). |
 | Undo back-adjustment | on | See above. |
+| Write order book | on | Every change of the 10-level order book (side, add / update / remove, level, price, size), one file a day in `Documents\NinjaTrader 8\e5n\depth` (not in a backtest; background thread; the nightly job compresses finished days). |
 
 ### Account (group "2. Account")
 
