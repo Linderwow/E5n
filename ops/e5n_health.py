@@ -114,12 +114,14 @@ def account_checks(tag, st, ev):
         W.append(f"{tag}: evaluation target reached - E5n is flat for good on this account; once Bulenox confirms the pass, run E5n on the funded account (Account mode Funded)")
     if mode == 'Funded' and cfg:
         start, dd, lock, per = (float(cfg.group(i)) for i in range(1, 5)); mx = int(cfg.group(5))
+        bol = re.search(r'band only until lock (on|off)', live[-1][3]); bol = bool(bol) and bol.group(1) == 'on'
         bad = []
         for e in [e for e in ev if e[1] == 'sizing'][-30:]:
-            q = re.search(r'balance (\S+), highest close (\S+), threshold (\S+), cushion (\S+), units (\d+)', e[3])
+            q = re.search(r'balance (\S+), highest close (\S+), threshold (\S+), cushion (\S+), units (\d+) \(model (\d+)', e[3])
             if not q or q.group(1) == 'unknown': continue
-            s = A.Sizer('Funded', start, dd, lock, 0, per, mx, float(q.group(2)) - start)
-            if abs(start + s.threshold - float(q.group(3))) > 0.011 or s.units(float(q.group(1))) != int(q.group(5)): bad.append(e[0][:10])
+            s = A.Sizer('Funded', start, dd, lock, 0, per, mx, float(q.group(2)) - start); u, only = s.funded_size(float(q.group(1)), bol)
+            if abs(start + s.threshold - float(q.group(3))) > 0.011 or u != int(q.group(5)) or (only and int(q.group(6)) != 0): bad.append(e[0][:10])
+        if st.get('band_only'): W.append(f"{tag}: funded account on the band leg only until the threshold locks at start + {lock:,.0f} (by design)")
         if bad: P.append(f"{tag}: funded sizing does not follow the rule on {', '.join(bad[-5:])} - check the 'Account' settings")
         sz = [e for e in ev if e[1] == 'sizing']
         if len(sz) >= 2:

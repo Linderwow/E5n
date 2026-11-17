@@ -97,6 +97,18 @@ def main():
     rec('nightly: an unreadable account balance is a problem', any('not readable' in p for p in P))
     P, W, acc = H.account_checks('ACC', dict(state='running', account_mode='Fixed'), [])
     rec('nightly: fixed mode adds nothing', not P and not W and acc is None)
+    live_b = [live[0], 'live', 'ACC', live[3][:-1] + ', band only until lock on)']
+    pre = [live_b, ['2026-11-16 09:30:05', 'sizing', 'ACC', 'mode Funded, balance 51500.00, highest close 51500.00, threshold 49000.00, cushion 2500.00, units 1 (model 0, band 1), band leg only until the threshold locks']]
+    P, W, _ = H.account_checks('ACC', dict(st, units=1, balance=51500.0, threshold_balance=49000.0, cushion=2500.0, band_only=True), pre)
+    wrong = [live_b, ['2026-11-16 09:30:05', 'sizing', 'ACC', 'mode Funded, balance 51500.00, highest close 51500.00, threshold 49000.00, cushion 2500.00, units 1 (model 1, band 1)']]
+    P2, _, _ = H.account_checks('ACC', st, wrong)
+    post = [live_b] + good[1:]
+    P3, _, _ = H.account_checks('ACC', st, post)
+    sb = A.Sizer('Funded', START, 2500, 100, 3000, 2500, 4, 1500.0); sl = A.Sizer('Funded', START, 2500, 100, 3000, 2500, 4, 9000.0)
+    rec('band only until the lock: 1 band micro and no model leg before the threshold locks, normal units after; the nightly accepts it and flags a model leg traded too early',
+        not P and any('band leg only' in w for w in W) and any('does not follow the rule' in p for p in P2) and not P3
+        and sb.funded_size(START + 1500, True) == (1, True) and sl.funded_size(START + 9000, True) == (3, False) and sb.funded_size(START + 1500, False) == (1, False),
+        '; '.join(P + P2 + P3)[:200])
     import tempfile, pandas as pd
     tmp = tempfile.mkdtemp(prefix='e5n_fc_', dir=DATA); os.makedirs(os.path.join(tmp, 'MNQ_12-26'))
     with open(os.path.join(tmp, 'MNQ_12-26', '2026-11-16.csv'), 'w') as fh:

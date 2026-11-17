@@ -21,4 +21,8 @@ class Sizer:
         u = math.floor(self.cushion(balance) / self.per_unit)
         return 1 if u < 1 else self.max_units if u > self.max_units else int(u)
 
+    def funded_size(self, balance, band_only_until_lock):
+        band_only = self.mode == 'Funded' and bool(band_only_until_lock) and self.threshold < self.lock_above
+        return (1, True) if band_only else (self.units(balance), False)
+
     def target_reached(self, equity): return self.mode == 'Evaluation' and equity is not None and not math.isnan(equity) and equity - self.start >= self.target
