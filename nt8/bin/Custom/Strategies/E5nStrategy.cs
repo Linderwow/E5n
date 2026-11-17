@@ -37,7 +37,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private E5nSizer sizer;
 		private string accountPath;
 		private int units = 1;
-		private bool targetHit, sizedToday, closedToday, balanceWarned, liveAccount;
+		private bool targetHit, sizedToday, closedToday, balanceWarned, liveAccount, bandOnly;
 		private double lastBalance = double.NaN;
 
 		protected override void OnStateChange()
@@ -81,6 +81,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				CushionPerUnit	= 2500;
 				MaxUnits		= 4;
 				KnownHighBalance = 0;
+				BandOnlyUntilLock = true;
 			}
 			else if (State == State.DataLoaded)
 			{
@@ -187,7 +188,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 			else if (State == State.Realtime)
 			{
-				targetHit = false; units = 1; lastBalance = double.NaN; sizedToday = false; closedToday = false;
+				targetHit = false; units = 1; bandOnly = false; lastBalance = double.NaN; sizedToday = false; closedToday = false;
 				liveAccount = !isBacktest && AccountMode != E5nAccountMode.Fixed;
 				sizer = NewSizer(liveAccount ? ReadHigh() : 0.0);
 			}
@@ -267,7 +268,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 			int m = start.Hour * 60 + start.Minute;
 			if (m >= 959 || m < 570) legModel = 0;
 			if (AccountMode != E5nAccountMode.Fixed && sizer != null) UpdateAccount(m, cur);
-			int want = halted || targetHit || m >= 959 || m < 570 ? 0 : (legModel * Contracts + legBand * BandContracts) * units;
+			int want = halted || targetHit || m >= 959 || m < 570 ? 0 : (legModel * (bandOnly ? 0 : Contracts) + legBand * BandContracts) * units;
 			lastNet = want;
 			if (working > 0 && CurrentBar - workingBar >= 2)
 			{
@@ -300,11 +301,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 			if (!sizedToday && m >= 570)
 			{
 				sizedToday = true; double b = Balance(); lastBalance = b; sizer.Close(b); units = sizer.Units(b);
+				bandOnly = AccountMode == E5nAccountMode.Funded && BandOnlyUntilLock && sizer.Threshold < LockAbove;
+				if (bandOnly) units = 1;
 				if (sizer.TargetReached(b)) targetHit = true;
 				if (liveAccount) WriteHigh();
 				LogEvent("sizing", string.Format(CI, "mode {0}, balance {1}, highest close {2:0.00}, threshold {3:0.00}, cushion {4}, units {5} (model {6}, band {7}){8}", AccountMode,
 					double.IsNaN(b) ? "unknown" : b.ToString("0.00", CI), StartBalance + sizer.High, StartBalance + sizer.Threshold, double.IsNaN(b) ? "unknown" : sizer.Cushion(b).ToString("0.00", CI),
-					units, Contracts * units, BandContracts * units, targetHit ? ", evaluation target already reached - flat" : ""));
+					units, bandOnly ? 0 : Contracts * units, BandContracts * units, targetHit ? ", evaluation target already reached - flat" : bandOnly ? ", band leg only until the threshold locks" : ""));
 			}
 			if (AccountMode == E5nAccountMode.Evaluation && !targetHit)
 			{
@@ -381,7 +384,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		{
 			if (AccountMode == E5nAccountMode.Fixed) return "Fixed";
 			if (AccountMode == E5nAccountMode.Evaluation) return string.Format(CI, "Evaluation (start {0:0}, target {1:0})", StartBalance, EvalTarget);
-			return string.Format(CI, "Funded (start {0:0}, drawdown {1:0}, lock {2:0}, cushion per unit {3:0}, max units {4}, known high {5:0})", StartBalance, TrailingDrawdown, LockAbove, CushionPerUnit, MaxUnits, KnownHighBalance);
+			return string.Format(CI, "Funded (start {0:0}, drawdown {1:0}, lock {2:0}, cushion per unit {3:0}, max units {4}, known high {5:0}, band only until lock {6})", StartBalance, TrailingDrawdown, LockAbove, CushionPerUnit, MaxUnits, KnownHighBalance, BandOnlyUntilLock ? "on" : "off");
 		}
 
 		private void Trade(int cur, int want)
@@ -616,9 +619,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 					tw != null ? System.Threading.Interlocked.Read(ref tw.Written) : 0, tw != null ? System.Threading.Interlocked.Read(ref tw.Errors) : 0, tw != null ? tw.Queue.Count : 0,
 					dw != null ? System.Threading.Interlocked.Read(ref dw.Written) : 0, dw != null ? System.Threading.Interlocked.Read(ref dw.Errors) : 0, dw != null ? dw.Queue.Count : 0);
 				bool sized = sizer != null && AccountMode != E5nAccountMode.Fixed;
-				json = json.Substring(0, json.Length - 1) + string.Format(CI, ",\"account_mode\":\"{0}\",\"units\":{1},\"balance\":{2},\"threshold_balance\":{3},\"cushion\":{4},\"target_reached\":{5}}}", AccountMode, units,
+				json = json.Substring(0, json.Length - 1) + string.Format(CI, ",\"account_mode\":\"{0}\",\"units\":{1},\"balance\":{2},\"threshold_balance\":{3},\"cushion\":{4},\"target_reached\":{5},\"band_only\":{6}}}", AccountMode, units,
 					sized && !double.IsNaN(lastBalance) ? lastBalance.ToString("0.00", CI) : "null", sized ? (StartBalance + sizer.Threshold).ToString("0.00", CI) : "null",
-					sized && !double.IsNaN(lastBalance) ? sizer.Cushion(lastBalance).ToString("0.00", CI) : "null", targetHit ? "true" : "false");
+					sized && !double.IsNaN(lastBalance) ? sizer.Cushion(lastBalance).ToString("0.00", CI) : "null", targetHit ? "true" : "false", bandOnly ? "true" : "false");
 				File.WriteAllText(statusPath, json);
 			}
 			catch (Exception ex) { Print("E5nStrategy: status write failed: " + ex.Message); }
@@ -645,6 +648,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		[NinjaScriptProperty] [Range(0, 1000000)] [Display(Name = "Funded: cushion per unit ($)", Description = "Balance above the threshold needed for each unit (as tested: 2500). Funded mode only.", GroupName = "2. Account", Order = 6)] public double CushionPerUnit { get; set; }
 		[NinjaScriptProperty] [Range(1, 20)] [Display(Name = "Funded: max units", Description = "Most units at once (as tested: 4). Funded mode only.", GroupName = "2. Account", Order = 7)] public int MaxUnits { get; set; }
 		[NinjaScriptProperty] [Range(0, 10000000)] [Display(Name = "Highest end-of-day balance ($, 0 = tracked)", Description = "Only if the account traded before E5n ran on it: its highest end-of-day balance so far, from the statement. E5n keeps track from then on in e5n\\logs\\E5n_account_*.json.", GroupName = "2. Account", Order = 8)] public double KnownHighBalance { get; set; }
+		[NinjaScriptProperty] [Display(Name = "Funded: band leg only until the lock", Description = "Funded mode only: trade 1 band-leg micro and no model leg until the trailing-drawdown threshold locks (start + 'drawdown lock above start'), then the contract settings times units. At realistic fill costs this raised the chance of a payout from 68% to 76% in testing. Fixed and Evaluation modes ignore it.", GroupName = "2. Account", Order = 9)] public bool BandOnlyUntilLock { get; set; }
 		#endregion
 	}
 }

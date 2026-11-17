@@ -110,6 +110,7 @@ continuous series.
 | Evaluation target | 3000 | Profit target. Evaluation mode only. |
 | Funded: cushion per unit | 2500 | Funded mode: units = balance above the threshold divided by this, rounded down, at least 1. |
 | Funded: max units | 4 | Funded mode: the most units at once. |
+| Funded: band leg only until the lock | on | Funded mode only: 1 band-leg micro and no model leg until the trailing-drawdown threshold locks at start + the lock amount, then the contract settings times units. Raised the chance of a payout from 68% to 76% in testing at realistic fill costs. |
 | Highest end-of-day balance | 0 | Only for an account that traded before E5n ran on it: its highest end-of-day balance so far. 0 = E5n tracks it from the start (kept in `e5n\logs\E5n_account_*.json`). |
 
 The defaults are a 50K account with a $2,500 end-of-day trailing drawdown that locks at start + $100 and a $3,000 target;
