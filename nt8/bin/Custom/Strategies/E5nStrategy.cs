@@ -37,7 +37,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 		private E5nSizer sizer;
 		private string accountPath;
 		private int units = 1;
-		private bool targetHit, sizedToday, closedToday, balanceWarned, liveAccount, bandOnly;
+		private bool targetHit, sizedToday, closedToday, balanceWarned, liveAccount, bandOnly, acctMismatch;
+		private int lastAccountPos;
 		private double lastBalance = double.NaN;
 
 		protected override void OnStateChange()
@@ -276,7 +277,25 @@ namespace NinjaTrader.NinjaScript.Strategies
 				if (!stuckNoted) { stuckNoted = true; LogEvent("order_pending", string.Format(CI, "{0} order(s) still not final after 2 bars - the position is re-read and orders resume", working), true); }
 				working = 0;
 			}
-			if (want != cur && working == 0) Trade(cur, want);
+			if (State == State.Realtime && !isBacktest && working == 0)
+			{
+				int acct = cur;
+				try
+				{
+					if (PositionAccount != null)
+						acct = PositionAccount.MarketPosition == MarketPosition.Long ? PositionAccount.Quantity : PositionAccount.MarketPosition == MarketPosition.Short ? -PositionAccount.Quantity : 0;
+				}
+				catch { acct = cur; }
+				if ((acct != cur) != acctMismatch)
+				{
+					acctMismatch = acct != cur; lastAccountPos = acct;
+					LogEvent(acctMismatch ? "account_mismatch" : "account_match", acctMismatch
+						? string.Format(CI, "the account holds {0} while E5n holds {1} - no orders until they match; flatten the account in NinjaTrader (E5n resumes by itself)", acct, cur)
+						: string.Format(CI, "account and E5n agree again ({0}) - orders resume", cur), true);
+				}
+				lastAccountPos = acct;
+			}
+			if (want != cur && working == 0 && !acctMismatch) Trade(cur, want);
 			if (d != null && decisionLog != null && (isBacktest || State == State.Realtime))
 			{
 				try
@@ -289,7 +308,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 				catch { }
 			}
 			if (barsDir != null) LogBar(et, start, Open[0] - adj, High[0] - adj, Low[0] - adj, Close[0] - adj, Volume[0]);
-			if (State == State.Realtime && (d != null || m >= 959)) WriteStatus(halted ? "halted" : "running");
+			if (State == State.Realtime && (d != null || m >= 959 || acctMismatch)) WriteStatus(acctMismatch ? "account_mismatch" : halted ? "halted" : "running");
 		}
 
 		private void UpdateAccount(int m, int cur)
@@ -620,9 +639,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 					tw != null ? System.Threading.Interlocked.Read(ref tw.Written) : 0, tw != null ? System.Threading.Interlocked.Read(ref tw.Errors) : 0, tw != null ? tw.Queue.Count : 0,
 					dw != null ? System.Threading.Interlocked.Read(ref dw.Written) : 0, dw != null ? System.Threading.Interlocked.Read(ref dw.Errors) : 0, dw != null ? dw.Queue.Count : 0);
 				bool sized = sizer != null && AccountMode != E5nAccountMode.Fixed;
-				json = json.Substring(0, json.Length - 1) + string.Format(CI, ",\"account_mode\":\"{0}\",\"units\":{1},\"balance\":{2},\"threshold_balance\":{3},\"cushion\":{4},\"target_reached\":{5},\"band_only\":{6},\"size\":{7}}}", AccountMode, units,
+				json = json.Substring(0, json.Length - 1) + string.Format(CI, ",\"account_mode\":\"{0}\",\"units\":{1},\"balance\":{2},\"threshold_balance\":{3},\"cushion\":{4},\"target_reached\":{5},\"band_only\":{6},\"size\":{7},\"account_position\":{8},\"account_mismatch\":{9}}}", AccountMode, units,
 					sized && !double.IsNaN(lastBalance) ? lastBalance.ToString("0.00", CI) : "null", sized ? (StartBalance + sizer.Threshold).ToString("0.00", CI) : "null",
-					sized && !double.IsNaN(lastBalance) ? sizer.Cushion(lastBalance).ToString("0.00", CI) : "null", targetHit ? "true" : "false", bandOnly ? "true" : "false", Size);
+					sized && !double.IsNaN(lastBalance) ? sizer.Cushion(lastBalance).ToString("0.00", CI) : "null", targetHit ? "true" : "false", bandOnly ? "true" : "false", Size, lastAccountPos, acctMismatch ? "true" : "false");
 				File.WriteAllText(statusPath, json);
 			}
 			catch (Exception ex) { Print("E5nStrategy: status write failed: " + ex.Message); }

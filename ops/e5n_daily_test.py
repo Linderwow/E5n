@@ -228,6 +228,16 @@ import json as _j
 check('T39 checkpoint result is plain JSON (no numpy values)', isinstance(n1, int) and bool(_j.dumps(CK2.ledger(pd.DataFrame({'book_usd': [10.0, -5.0], 'model_usd': [1.0, 2.0]})))))
 check('T38 dry-spell gauge: sessions since the last high, graded normal / long / longer than ever', n1 == 2 and 'normal' in s1_ and n2 == 40 and 'long but seen' in s2_ and n3 == 260 and 'LONGER' in s3_ and n4 == 0,
       str((n1, s1_, n2, n3, n4)))
+d8 = tempfile.mkdtemp()
+try:
+    os.makedirs(os.path.join(d8, 'log'))
+    with open(os.path.join(d8, 'log', 'log.20261117.00000.txt'), 'w') as fh8:
+        fh8.write("2026-11-17 12:45:00:422|1|64|Instrument='MNQ 12-26' Account='Sim101' Average price=27005 Quantity=1 Market position=Short Operation=Operation_Add\n"
+                  "2026-11-17 16:00:01:145|1|64|Instrument='MNQ 12-26' Account='Sim101' Average price=26953 Quantity=1 Market position=Short Operation=Update\n"
+                  "2026-11-17 16:00:02:000|1|64|Instrument='MNQ 12-26' Account='Other' Average price=0 Quantity=0 Market position=Flat Operation=Remove\n")
+    ap8 = HL.account_position_from_nt_log(d8, 'Sim101', dt.date(2026, 11, 17))
+    check('T40 a position left on the account after the close is read from NinjaTrader\'s own log (per account)', ap8 == ('Short', 1, '16:00:01'), str(ap8))
+finally: shutil.rmtree(d8, ignore_errors=True)
 d7 = tempfile.mkdtemp()
 try:
     for c7, px7 in (('MNQ_12-26', 25000.0), ('MNQ_03-27', 25280.0)):

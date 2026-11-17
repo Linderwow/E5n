@@ -1,4 +1,4 @@
-import os, glob, gzip, hashlib, json, shutil, subprocess, datetime as dt
+import os, re, glob, gzip, hashlib, json, shutil, subprocess, datetime as dt
 import numpy as np, pandas as pd
 import e5n_calendar as CAL
 
@@ -130,6 +130,21 @@ def account_checks(tag, st, ev):
     return P, W, acc
 
 
+def account_position_from_nt_log(nt_root, account, day):
+    if day is None: return None
+    f = os.path.join(nt_root, 'log', f"log.{str(day).replace('-', '')}.00000.txt")
+    if not os.path.exists(f): return None
+    last = None
+    pat = re.compile(r"^(\S+ \S+)\|.*Account='" + re.escape(account) + r"' Average price=\S+ Quantity=(\d+) Market position=(\w+)")
+    try:
+        with open(f, encoding='utf-8', errors='replace') as fh:
+            for ln in fh:
+                m = pat.search(ln)
+                if m: last = (m.group(3), int(m.group(2)), m.group(1)[11:19])
+    except OSError: return None
+    return last
+
+
 def compress_depth(ddir, before):
     if before is None: return 0
     n = 0
@@ -198,6 +213,13 @@ def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb
             if st.get('state') == 'refused': P.append(f"{tag}: E5n refused to start - {st.get('halt_note', '')}")
             elif st.get('state') == 'terminated': P.append(f"{tag}: E5n was stopped (state terminated at {upd:%Y-%m-%d %H:%M}) - re-enable it")
             elif st.get('state') == 'halted': W.append(f"{tag}: daily loss stop hit - {st.get('halt_note', '')}")
+            elif st.get('state') == 'account_mismatch':
+                P.append(f"{tag}: the account holds {st.get('account_position')} contract(s) while E5n holds {st.get('quantity')} - E5n sends no orders until they match; flatten the account in NinjaTrader")
+            mm = [e for e in ev if e[1] == 'account_mismatch' and last and e[0][:10] == str(last)]
+            if mm and st.get('state') != 'account_mismatch': W.append(f"{tag}: account and E5n disagreed during {last} ({mm[-1][3][:120]}) - they agree again now")
+            ap = account_position_from_nt_log(os.path.dirname(os.path.dirname(logs_dir)), tag.split('_', 1)[1] if '_' in tag else tag, last)
+            if ap is not None and str(st.get('position', '')).lower() == 'flat' and ap[0] != 'Flat':
+                P.append(f"{tag}: NinjaTrader shows the account {ap[0]} {ap[1]} at {ap[2]} while E5n is flat - a position left over (usually from a restart while E5n held a trade); flatten it in NinjaTrader")
             if st.get('state') in ('running', 'halted') and heartbeat_due(now) and age > 10:
                 P.append(f"{tag}: no update for {age:.0f} minutes while the market is open - NinjaTrader closed, the strategy disabled or the data feed down")
             if st.get('connected') is False and st.get('state') in ('running', 'halted'): P.append(f"{tag}: account connection was down at the last update ({upd:%H:%M})")
