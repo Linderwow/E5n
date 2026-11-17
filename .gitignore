@@ -18,3 +18,16 @@
 /nt8/e5n/*
 !/nt8/e5n/e5n_models.txt
 !/nt8/e5n/e5n_models_15min.txt
+!/ops/
+/ops/*
+!/ops/*.py
+!/ops/research/
+/ops/research/*
+!/ops/research/*.py
+/ops/e5n_refit_test.py
+/ops/e5n_verify.py
+/ops/research/e5a_runner.py
+!/tools/
+/tools/*
+!/tools/*.py
+/tools/publish_check.py

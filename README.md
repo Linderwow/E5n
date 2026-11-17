@@ -21,6 +21,23 @@ will repeat.
 | `nt8/e5n/e5n_models.txt` | 15 frozen 5-minute models. One per year 2013-2026, each trained only on earlier years, so a backtest of any year is out of sample; `final` (trained to 2026-10-15) serves every later date. |
 | `nt8/e5n/e5n_models_15min.txt` | The same 15 models for the 15-minute check. |
 
+## Python tooling
+
+NinjaTrader runs C# only, so the strategy is C#. Everything around it is Python 3.12 (pandas, numpy, pyarrow).
+
+| Path | What it is |
+|---|---|
+| `ops/e5n_daily.py` | The nightly job: scores the frozen models and the band leg on the day's one-minute bars, keeps the forward ledger, cross-checks the strategy's own logs, writes the status file and the trade map. `--help` lists the options. |
+| `ops/e5n_features.py`, `e5n_model.py`, `e5n_calendar.py`, `e5n_band.py` | Python twins of the engine: the 83 indicators, the tree-model evaluator, the exchange calendar, the band leg. |
+| `ops/e5n_account.py` | Python twin of the account modes (evaluation stand-down, funded sizing from the cushion). |
+| `ops/e5n_refit.py` | The yearly model refit: retrain, check, stage the new model files. |
+| `ops/e5n_health.py`, `e5n_checkpoints.py`, `e5n_flow.py`, `e5n_map.py` | Live checks, forward-test decision lines, order-flow aggregation, the trade map. |
+| `ops/e5n_train.py`, `e5n_train15.py` | The original walk-forward model build. |
+| `ops/*_test.py` | Standalone test scripts, each prints ALL PASS. |
+| `ops/research/` | The research behind every decision, including the variants that were tested and rejected. |
+
+The data these scripts read is not in the repository.
+
 ## How it trades
 
 Data: one-minute MNQ bars with the full trading session loaded. Half days and exchange holidays are skipped.
