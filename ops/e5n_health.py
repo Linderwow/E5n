@@ -283,7 +283,7 @@ def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb
         if st_.get('tick_errors'): W.append(f"{tag}: the tick writer reported {st_['tick_errors']} write error(s)")
         if (st_.get('tick_queue') or 0) > 200000: W.append(f"{tag}: {st_['tick_queue']:,} ticks waiting to be written - the disk is not keeping up")
         if st_.get('account_mode', 'Fixed') == 'Fixed':
-            drift = [f"{k} {st_.get(k)} (tested {v})" for k, v in (('contracts', 1), ('check15', True), ('band_contracts', 1), ('max_daily_loss', 0)) if k in st_ and st_.get(k) != v]
+            drift = [f"{k} {st_.get(k)} (tested {v})" for k, v in (('size', 1), ('contracts', 1), ('check15', True), ('band_contracts', 1), ('max_daily_loss', 0)) if k in st_ and st_.get(k) != v]
             if drift: W.append(f"{tag}: settings differ from the tested book the forward ledger assumes - " + ', '.join(drift))
         if 'depth_written' in st_:
             I[tag].update(depth_written=st_.get('depth_written'), depth_errors=st_.get('depth_errors'))

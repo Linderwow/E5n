@@ -86,9 +86,10 @@ continuous series.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| Model-leg contracts | 1 | Micros for the forecast leg. 0 switches the leg off. |
+| Contracts | 1 | Micros per leg: the model leg and the band leg each trade this many, as one net position (at most twice this). In Funded mode also times the day's units. |
+| Model leg x | 1 | Group "3. Leg sizes (advanced)": the forecast leg trades this many times Contracts. 0 switches the leg off. |
 | 15-minute check | on | The forecast leg needs the same sign from the 15-minute model. |
-| Band-leg contracts | 1 | Micros for the band leg. 0 switches the leg off. |
+| Band leg x | 1 | Group "3. Leg sizes (advanced)": the band leg trades this many times Contracts. 0 switches the leg off; the evaluation setup uses 6. |
 | Warm-up sessions | 20 | Complete sessions needed in the loaded history before the first trade. |
 | Daily loss stop | 0 | Flat for the rest of the day once the day's loss reaches this many dollars. 0 is off, as tested. |
 | Model file | blank | Blank uses `Documents\NinjaTrader 8\e5n\e5n_models.txt`. |
@@ -108,7 +109,7 @@ continuous series.
 | Trailing drawdown | 2500 | How far the end-of-day threshold trails the highest end-of-day balance. |
 | Drawdown lock above start | 100 | The threshold stops trailing once it reaches start + this amount. |
 | Evaluation target | 3000 | Profit target. Evaluation mode only. |
-| Funded: cushion per unit | 2500 | Funded mode: units = balance above the threshold divided by this, rounded down, at least 1. |
+| Funded: cushion per unit | 3000 | Funded mode: units = balance above the threshold divided by this, rounded down, at least 1. 3000 gave the best typical result at realistic fill costs. |
 | Funded: max units | 4 | Funded mode: the most units at once. |
 | Funded: band leg only until the lock | on | Funded mode only: 1 band-leg micro and no model leg until the trailing-drawdown threshold locks at start + the lock amount, then the contract settings times units. Raised the chance of a payout from 68% to 76% in testing at realistic fill costs. |
 | Highest end-of-day balance | 0 | Only for an account that traded before E5n ran on it: its highest end-of-day balance so far. 0 = E5n tracks it from the start (kept in `e5n\logs\E5n_account_*.json`). |
