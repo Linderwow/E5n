@@ -127,6 +127,22 @@ open(os.path.join(lg_, 'E5n_events_MNQ_Sim101.txt'), 'w').write('2026-11-13 12:3
 try: hr = HL.check(now, fb, lg_, own_, rec_, free_gb={'C:' + chr(92): 500, 'D:' + chr(92): 500})
 finally: shutil.rmtree(t_, ignore_errors=True)
 check("T19b a restart (terminated, then live again) is not reported as stopped", not any('stopped' in x for x in hr['problems']) and any('restarted' in x for x in hr['info'].get('notes', [])), str(hr))
+EV_AFTER_CLOSE = '2026-11-12 10:00:00|live|Sim101|start' + chr(10) + '2026-11-13 17:03:34|terminated|Sim101|position Flat x0' + chr(10) + '2026-11-13 17:03:45|live|Sim101|restart' + chr(10)
+for name_, rows_, ev_, want_ in (
+        ("T19c a restart after the close still checks the whole session (75 expected)", HL.DECISIONS, EV_AFTER_CLOSE, lambda h: h['info']['MNQ_Sim101']['expected'] == 75 and not h['problems']),
+        ("T19d a decision lost in a short restart is a warning, not a problem", [m for m in HL.DECISIONS if m != 115],
+         '2026-11-12 10:00:00|live|Sim101|start' + chr(10) + '2026-11-13 11:24:59|terminated|Sim101|position Short x1' + chr(10) + '2026-11-13 11:25:09|live|Sim101|restart' + chr(10),
+         lambda h: not h['problems'] and any('skipped' in x and '11:25' in x for x in h['warnings'])),
+        ("T19e decisions missing before an after-close restart are still a problem", [m for m in HL.DECISIONS if not 60 <= m <= 90], EV_AFTER_CLOSE,
+         lambda h: any('7 of 75 decisions missing' in x for x in h['problems'])),
+        ("T19f E5n off for hours mid-session: missing decisions are a problem", [m for m in HL.DECISIONS if m < 150],
+         '2026-11-12 10:00:00|live|Sim101|start' + chr(10) + '2026-11-13 12:00:30|terminated|Sim101|position Flat x0' + chr(10) + '2026-11-13 17:03:45|live|Sim101|restart' + chr(10),
+         lambda h: any('decisions missing' in x and '12:00-15:55' in x for x in h['problems']))):
+    t_, lg_, own_, rec_ = live_env(rows=rows_, status=dict(live_since=ev_.strip().splitlines()[-1].split('|')[0]))
+    open(os.path.join(lg_, 'E5n_events_MNQ_Sim101.txt'), 'w').write(ev_)
+    try: hx = HL.check(now, fb, lg_, own_, rec_, free_gb={'C:' + chr(92): 500, 'D:' + chr(92): 500})
+    finally: shutil.rmtree(t_, ignore_errors=True)
+    check(name_, want_(hx), str(hx['problems']) + str(hx['warnings']))
 h = run(status=dict(state='refused', halt_note='not started: test')); check("T19 a refused start is reported with its reason", any('refused' in x and 'test' in x for x in h['problems']), str(h['problems']))
 h = run(extra="garbage line\n2026-11-13,09:45,15,0.0,0,0.0,0,final,0,0,0,28000,0,40\n")
 check("T20 broken lines and duplicate decisions are reported", any('broken line' in x for x in h['problems']) and any('duplicate' in x for x in h['problems']), str(h['problems']))
@@ -251,5 +267,29 @@ try:
     fc7 = HL.fill_costs(fx7, d7)
     check('T37 fill cost on a roll day is measured against the contract that was traded (not the other one, ~280 points away)', len(fc7) == 1 and abs(fc7.ticks.iloc[0] - 2.0) < 1e-9, str(fc7.values.tolist()))
 finally: shutil.rmtree(d7, ignore_errors=True)
+d8 = tempfile.mkdtemp()
+try:
+    bd8, td8 = os.path.join(d8, 'bars', 'MNQ_12-26'), os.path.join(d8, 'ticks', 'MNQ_12-26'); os.makedirs(bd8); os.makedirs(td8)
+    for dd, start, end in ((dt.date(2026, 11, 12), 18 * 60, 24 * 60), (dt.date(2026, 11, 13), 0, 17 * 60)):
+        mins = range(start, end)
+        pd.DataFrame({'time_et': [f"{pd.Timestamp(dd) + pd.Timedelta(minutes=m + 1):%Y-%m-%d %H:%M}" for m in mins], 'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0, 'volume': 3}).to_csv(os.path.join(bd8, f'{dd}.csv'), index=False)
+        tk = [(f"{pd.Timestamp(dd) + pd.Timedelta(minutes=m, seconds=s):%Y-%m-%d %H:%M:%S}.000", 1.0, z, 1.0, 1.0, 1, 1) for m in mins for s, z in ((10, 1), (40, 2))]
+        pd.DataFrame(tk, columns=['time_et', 'price', 'size', 'bid', 'ask', 'bid_size', 'ask_size']).to_csv(os.path.join(td8, f'{dd}.csv'), index=False)
+    tc8 = HL.tick_completeness(os.path.join(d8, 'ticks'), os.path.join(d8, 'bars'), dt.date(2026, 11, 13))
+    check('T42 ticks complete: tick volume equals bar volume on every minute of the session (18:00 the evening before to 17:00)', tc8['runs'] == [] and tc8['minutes'] == 23 * 60 and tc8['ticks'] == tc8['bar'] == 3 * 23 * 60, str({k: tc8[k] for k in ('bar', 'ticks', 'minutes')}))
+    f8 = os.path.join(td8, '2026-11-13.csv'); t8 = pd.read_csv(f8)
+    keep = ~t8.time_et.str.slice(11, 16).between('10:00', '10:04') & (t8.time_et != '2026-11-13 14:30:40.000')
+    t8[keep].to_csv(f8, index=False)
+    tc8 = HL.tick_completeness(os.path.join(d8, 'ticks'), os.path.join(d8, 'bars'), dt.date(2026, 11, 13))
+    rr = [HL.fmt_run(r) for r in tc8['runs']]
+    check('T43 missing ticks are found to the minute and the contract: 10:01-10:05 (15) and 14:31 (2)', rr == ['11-13 10:01-10:05 (15 contracts)', '11-13 14:31 (2 contracts)'] and tc8['bar'] - tc8['ticks'] == 17, str(rr))
+finally: shutil.rmtree(d8, ignore_errors=True)
+t_, lg_, own_, rec_ = live_env()
+with open(os.path.join(lg_, 'E5n_fills_MNQ_Sim101.csv'), 'w') as fh9:
+    fh9.write("time_et,order,action,quantity,price,position_after\n2026-11-13 11:20:00.420,E5nShort,SellShort,1,26964.75,-1\n"
+              "2026-11-13 12:11:00.000,E5nCover,BuyToCover,1,26935.75,0\n2026-11-13 12:35:00.404,E5nLong,Buy,1,27014.75,1\n")
+try: h9 = HL.check(now, fb, lg_, own_, rec_, free_gb={'C:' + chr(92): 500, 'D:' + chr(92): 500})
+finally: shutil.rmtree(t_, ignore_errors=True)
+check('T44 a paper exit while waiting until flat (stamped on the bar, :00.000) is named and left out of the fills', h9['info']['MNQ_Sim101'].get('fills_last_session') == 2 and any('paper exits' in x and '12:11' in x for x in h9['warnings']), str(h9['warnings']))
 print('ALL PASS' if not FAIL else 'FAILED: ' + ', '.join(FAIL))
 sys.exit(1 if FAIL else 0)

@@ -169,6 +169,43 @@ def compress_depth(ddir, before):
     return n
 
 
+def tick_completeness(tdir, bars_dir, last):
+    prev = last - dt.timedelta(days=1)
+    lo, hi = pd.Timestamp(prev) + pd.Timedelta(hours=18), pd.Timestamp(last) + pd.Timedelta(hours=17)
+    bar_v, tick_v = [], []
+    for cdir in sorted(glob.glob(os.path.join(bars_dir, 'MNQ_*'))):
+        c = os.path.basename(cdir)
+        for d in (prev, last):
+            bf, tf = os.path.join(cdir, f'{d}.csv'), os.path.join(tdir, c, f'{d}.csv')
+            if not os.path.exists(bf): continue
+            try:
+                b = pd.read_csv(bf, usecols=['time_et', 'volume'])
+                bt = pd.to_datetime(b.time_et, format='ISO8601', errors='coerce')
+                bar_v.append(b.volume.groupby(bt).sum())
+                if os.path.exists(tf):
+                    tk = pd.read_csv(tf, usecols=['time_et', 'size'])
+                    tt = pd.to_datetime(tk.time_et, format='ISO8601', errors='coerce').dt.floor('min') + pd.Timedelta(minutes=1)
+                    tick_v.append(tk['size'].groupby(tt).sum())
+            except (OSError, ValueError, KeyError, pd.errors.ParserError, pd.errors.EmptyDataError): continue
+    if not bar_v: return None
+    bv = pd.concat(bar_v).groupby(level=0).sum()
+    bv = bv[(bv.index > lo) & (bv.index <= hi) & (bv > 0)]
+    if not len(bv): return None
+    tv = (pd.concat(tick_v).groupby(level=0).sum() if tick_v else pd.Series(dtype=float)).reindex(bv.index).fillna(0)
+    short = (bv - tv)[bv > tv]
+    runs, i = [], list(short.index)
+    for k, x in enumerate(i):
+        if k == 0 or x - i[k - 1] > pd.Timedelta(minutes=1): st = x
+        if k == len(i) - 1 or i[k + 1] - x > pd.Timedelta(minutes=1): runs.append((st, x, int(short[st:x].sum())))
+    return dict(bar=int(bv.sum()), ticks=int(tv.clip(upper=bv).sum()), minutes=len(bv), equal=int((bv == tv).sum()), runs=runs)
+
+
+def fmt_run(r):
+    a, b, n = r
+    span = f"{a:%m-%d %H:%M}" if a == b else f"{a:%m-%d %H:%M}-{b:%H:%M}"
+    return f"{span} ({n:,} contracts)"
+
+
 def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb=None, rec_status=None, ticks_dir=None):
     P, W, I = [], [], {}
     today = now.date()
@@ -241,12 +278,23 @@ def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb
             dup = int(x.duplicated(['date', 'minute']).sum())
             if dup: P.append(f"{tag}: decision log has {dup} duplicate decision(s)")
         if last is None: continue
-        since = pd.Timestamp(st['live_since']) if st and st.get('live_since') else (pd.Timestamp(x.date.min()) if len(x) else pd.Timestamp(now))
+        lives = [pd.Timestamp(e[0]) for e in ev if e[1] == 'live']
+        if lives: since = min(lives)
+        else: since = pd.Timestamp(st['live_since']) if st and st.get('live_since') else (pd.Timestamp(x.date.min()) if len(x) else pd.Timestamp(now))
+        restarts = []
+        for i, e in enumerate(ev):
+            if e[1] in ('terminated', 'refused'):
+                nxt = next((pd.Timestamp(f[0]) for f in ev[i + 1:] if f[1] == 'live'), None)
+                if nxt is not None and (nxt - pd.Timestamp(e[0])).total_seconds() <= 120: restarts.append((pd.Timestamp(e[0]), nxt + pd.Timedelta(seconds=60)))
         y = x[x.date == str(last)] if len(x) else pd.DataFrame(columns=['minute']); got = set(y.minute.astype(int))
-        exp = [p for p in DECISIONS if (p - 1) in present and pd.Timestamp(last) + pd.Timedelta(minutes=570 + p) > since]
+        at = lambda p: pd.Timestamp(last) + pd.Timedelta(minutes=570 + p)
+        exp = [p for p in DECISIONS if (p - 1) in present and at(p) > since]
         miss = [p for p in exp if p not in got]
+        in_restart = [p for p in miss if any(a <= at(p) <= b for a, b in restarts)]
+        miss = [p for p in miss if p not in in_restart]
         r.update(decisions_last_session=len(got), expected=len(exp))
-        if exp and miss and len(miss) == len(exp): P.append(f"{tag}: no decisions at all on {last} although bars exist - the strategy was not running")
+        if in_restart: W.append(f"{tag}: {len(in_restart)} decision(s) skipped on {last} while E5n was restarting ({ranges(in_restart)})")
+        if exp and miss and len(miss) + len(in_restart) == len(exp): P.append(f"{tag}: no decisions at all on {last} although bars exist - the strategy was not running")
         elif miss: P.append(f"{tag}: {len(miss)} of {len(exp)} decisions missing on {last} ({ranges(miss)}) - the strategy or its data stopped then")
         if 'net' in y.columns and len(y) > 1:
             yy = y.sort_values('minute'); nxt = yy.position.shift(-1); ok = (yy.minute.shift(-1) - yy.minute == 5)
@@ -254,6 +302,10 @@ def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb
             if int(ok.sum()) and (nxt[ok] != yy.net[ok]).sum(): P.append(f"{tag}: on {last} the position did not follow the net target {int((nxt[ok] != yy.net[ok]).sum())} time(s)")
         fx, fbad, ferr = read_log(os.path.join(logs_dir, f'E5n_fills_{tag}.csv'))
         if fx is not None and len(fx):
+            paper = fx.time_et.astype(str).str.endswith(':00.000')
+            p1 = fx[paper & fx.time_et.astype(str).str.startswith(str(last))]
+            if len(p1): W.append(f"{tag}: {len(p1)} fill(s) on {last} at {', '.join(p1.time_et.astype(str).str.slice(11, 16))} were paper exits while E5n waited until flat after a restart (no order reached the account) - left out of the fill cost; check the account position")
+            fx = fx[~paper]
             f1 = fx[fx.time_et.str.startswith(str(last))]; r['fills_last_session'] = int(len(f1))
             if fbad: P.append(f"{tag}: fill log has {fbad} broken line(s)")
             late = f1[~f1.time_et.str.slice(11, 16).between('09:30', '16:02')]
@@ -297,6 +349,13 @@ def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb
         since = min((dt.datetime.fromtimestamp(os.path.getctime(d)) for d in dirs), default=None)
         if since is not None and since < dt.datetime.combine(last, dt.time(9, 30)):
             W.append(f"E5n wrote no tick file for {last} - check 'Write ticks' in the strategy settings")
+    tc = tick_completeness(tdir, own_dir, last) if own_ticks else None
+    if tc is not None:
+        I['ticks_vs_bars'] = f"{tc['ticks']:,} of {tc['bar']:,} contracts in the {last} session ({tc['ticks'] / tc['bar']:.3%}), volume equal on {tc['equal']}/{tc['minutes']} minutes"
+        I['tick_holes'] = [fmt_run(r) for r in tc['runs']]
+        if tc['runs']:
+            W.append(f"ticks missing in the {last} session: {tc['bar'] - tc['ticks']:,} of {tc['bar']:,} contracts in " + ', '.join(fmt_run(r) for r in tc['runs'][:6])
+                     + (' ...' if len(tc['runs']) > 6 else '') + " - E5n was stopped or restarting then")
     for tag in live:
         sp = os.path.join(logs_dir, f'E5n_status_{tag}.json')
         try: st_ = json.load(open(sp, encoding='utf-8'))
