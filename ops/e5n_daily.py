@@ -312,7 +312,7 @@ def main():
         flow = FL.nightly(Tf, ff5, now)
     except Exception as e: flow = dict(error=f"{type(e).__name__}: {e}")
     logs, st = strategy_logs(dec, marks)
-    try: health = H.check(now, bars, os.path.join(NT_E5N, 'logs'), OWN_BARS, REC)
+    try: health = H.check(now, bars, os.path.join(NT_E5N, 'logs'), OWN_BARS, REC, system=True)
     except Exception as e: health = dict(problems=[f"live checks failed: {type(e).__name__}: {e}"], warnings=[], info={})
     problems += health['problems']
     if ck_ledger.get('status') == 'STOP AND REVIEW': problems += [f for f in ck_ledger['flags'] if f.startswith(('BOOK BELOW', 'MODEL LEG BELOW'))]
@@ -377,21 +377,26 @@ def main():
     return 1 if problems else 0
 
 
-def weekly_verify(now):
-    if now.weekday() != 4: return
+def full_verify(now):
     try:
-        p = subprocess.run([sys.executable.replace('pythonw.exe', 'python.exe'), '-B', os.path.join(HERE, 'e5n_verify.py')], cwd=HERE, capture_output=True, text=True,
-                           timeout=3000, creationflags=NOWIN, encoding='utf-8', errors='replace')
+        subprocess.run([sys.executable.replace('pythonw.exe', 'python.exe'), '-B', os.path.join(HERE, 'e5n_verify.py')], cwd=HERE, capture_output=True, text=True,
+                       timeout=3000, creationflags=NOWIN, encoding='utf-8', errors='replace')
         head = open(os.path.join(DATA, 'e5n_verify.txt'), encoding='utf-8').readline().strip()
+        if not head.startswith(f"VERIFY {now:%Y-%m-%d}"): head = f"VERIFY {now:%Y-%m-%d %H:%M}: did not complete (no new result file)"
     except Exception as e: head = f"VERIFY {now:%Y-%m-%d %H:%M}: did not complete ({type(e).__name__}: {e})"
-    with open(LOG, 'a', encoding='utf-8') as fh: fh.write(f"{dt.datetime.now():%Y-%m-%d %H:%M} | weekly full verification | {head}\n")
+    try:
+        with open(STATUS, encoding='utf-8') as fh: st = json.load(fh)
+        st['verify'] = head; tmp = STATUS + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh: json.dump(st, fh, indent=1)
+        os.replace(tmp, STATUS)
+    except Exception: pass
 
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
         print(__doc__); sys.exit(0 if sys.argv[1] in ('-h', '--help', '/?') else 2)
     try:
-        rc = main(); weekly_verify(dt.datetime.now()); sys.exit(rc)
+        rc = main(); full_verify(dt.datetime.now()); sys.exit(rc)
     except Exception as e:
         os.makedirs(DATA, exist_ok=True)
         with open(LOG, 'a', encoding='utf-8') as fh: fh.write(f"{dt.datetime.now():%Y-%m-%d %H:%M} | FAILED: {type(e).__name__}: {e}\n")

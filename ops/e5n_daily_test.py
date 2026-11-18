@@ -257,6 +257,10 @@ try:
                   "2026-11-17 16:00:02:000|1|64|Instrument='MNQ 12-26' Account='Other' Average price=0 Quantity=0 Market position=Flat Operation=Remove\n")
     ap8 = HL.account_position_from_nt_log(d8, 'Sim101', dt.date(2026, 11, 17))
     check('T40 a position left on the account after the close is read from NinjaTrader\'s own log (per account)', ap8 == ('Short', 1, '16:00:01'), str(ap8))
+    with open(os.path.join(d8, 'log', 'log.20261117.00001.txt'), 'w') as fh8:
+        fh8.write("2026-11-17 19:00:41:420|1|64|Instrument='MNQ 12-26' Account='Sim101' Average price=0 Quantity=0 Market position=Flat Operation=Remove\n")
+    ap8b = HL.account_position_from_nt_log(d8, 'Sim101', dt.date(2026, 11, 17))
+    check('T40b the leftover is still reported after it was closed by hand later that evening (and a second log file after a NinjaTrader restart is read)', ap8b == ('Short', 1, '16:00:01'), str(ap8b))
 finally: shutil.rmtree(d8, ignore_errors=True)
 d7 = tempfile.mkdtemp()
 try:
@@ -291,5 +295,45 @@ with open(os.path.join(lg_, 'E5n_fills_MNQ_Sim101.csv'), 'w') as fh9:
 try: h9 = HL.check(now, fb, lg_, own_, rec_, free_gb={'C:' + chr(92): 500, 'D:' + chr(92): 500})
 finally: shutil.rmtree(t_, ignore_errors=True)
 check('T44 a paper exit while waiting until flat (stamped on the bar, :00.000) is named and left out of the fills', h9['info']['MNQ_Sim101'].get('fills_last_session') == 2 and any('paper exits' in x and '12:11' in x for x in h9['warnings']), str(h9['warnings']))
+d10 = tempfile.mkdtemp()
+try:
+    os.makedirs(os.path.join(d10, 'log'))
+    q = chr(39)
+    def exl(ts, px, side, oid): return f"2026-11-13 {ts}|1|8|Execution={q}x{oid}{q} Instrument={q}MNQ 12-26{q} Account={q}Sim101{q} Exchange=Default Price={px} Quantity=1 Market position={side} Operation=Operation_Add Order={q}{oid}{q} Time={q}x{q}"
+    def orl(ts, oid, acct, name, state, extra=''): return f"2026-11-13 {ts}|1|32|Order={q}{oid}/{acct}{q} Name={q}{name}{q} New state={q}{state}{q} Instrument={q}MNQ 12-26{q}{extra}"
+    L10 = [orl('10:35:00:300', 'a1', 'Sim101', 'E5nLong', 'Filled'), exl('10:35:00:415', '27028.5', 'Long', 'a1'),
+           orl('11:00:00:300', 'a2', 'Sim101', 'E5nSell', 'Filled'), exl('11:00:00:414', '27050', 'Short', 'a2'),
+           orl('13:10:05:000', 'm1', 'Sim101', 'Close', 'Filled'), exl('13:10:05:100', '27100.25', 'Long', 'm1'),
+           orl('09:40:46:002', 'r1', 'EVAL-ACCT-00678', 'Entry', 'Rejected', f" Error={q}Order rejected{q} Native error={q}Order can be placed by administrators only{q}"),
+           f"2026-11-13 11:25:09:008|1|4|Enabling NinjaScript strategy {q}E5nStrategy/1{q} : On starting a real-time strategy - StartBehavior=WaitUntilFlat Position=MNQ 12-26 1S AccountPosition=MNQ 12-26 1S EntryHandling=All entries",
+           "2026-11-13 12:00:00:000|1|2|Bullenox: Primary connection=ConnectionLost, Price feed=ConnectionLost",
+           "2026-11-13 12:00:20:000|1|2|Bullenox: Primary connection=Connected, Price feed=Connected"]
+    open(os.path.join(d10, 'log', 'log.20261113.00000.txt'), 'w').write(chr(10).join(L10) + chr(10))
+    fx10 = pd.DataFrame({'time_et': ['2026-11-13 10:35:00.415', '2026-11-13 11:00:00.414', '2026-11-13 14:00:00.400'], 'action': ['Buy', 'Sell', 'SellShort'],
+                         'quantity': [1, 1, 1], 'price': [27028.5, 27050.0, 27000.0]})
+    P10, W10, I10 = HL.nt_log_audit(d10, 'Sim101', dt.date(2026, 11, 13), fx10)
+    check('T45 account audit: E5n fills match NinjaTrader executions (2/3), a trade by hand in the session and a fill never executed are problems',
+          I10['executions_matched'].startswith('2/3') and any('did not make' in x and '13:10:05' in x and "'Close'" in x for x in P10) and any('never executed' in x and '14:00:00' in x for x in P10), str(P10))
+    check('T46 account audit: a rejected order elsewhere is named with its reason (account masked), a start while holding a position is warned',
+          any('...678' in x and 'administrators only' in x for x in W10) and not any('EVAL-ACCT' in x for x in W10) and any('11:25:09' in x and 'held 1S' in x for x in W10), str(W10))
+    check('T47 account audit: a connection loss during the session is a problem', any('connection down during the session' in x and '12:00:00' in x for x in P10), str(P10))
+    check('T48 fill delays: a fill 4.2 s after the decision minute is named, 0.4 s is not',
+          HL.fill_delays(pd.DataFrame({'time_et': ['2026-11-13 10:35:00.415', '2026-11-13 10:40:04.200']}), dt.date(2026, 11, 13)) == [('10:40:04', 4.2)])
+    fake = {'PauseUpdates': '2026-11-15T10:00:00Z', 'Get-WinEvent': '2026-11-13 03:12' + chr(10), 'w32tm': '13:00:00, -1.5432100s'}
+    sP, sW, sI = HL.system_checks(dt.datetime(2026, 11, 13, 18, 45), run=lambda cmd: next((v for k, v in fake.items() if k in ' '.join(cmd)), ''))
+    check('T49 system: Windows Update pause ending in 2 days, a power cut and a clock 1.5 s off are all warned',
+          any('pause ends' in x for x in sW) and any('without a clean shutdown' in x and '03:12' in x for x in sW) and any('-1.54 s' in x for x in sW), str(sW))
+    bd = os.path.join(d10, 'bars', 'MNQ_12-26'); td = os.path.join(d10, 'ticks', 'MNQ_12-26'); os.makedirs(bd); os.makedirs(td)
+    pd.DataFrame({'time_et': ['2026-11-13 10:01', '2026-11-13 10:02'], 'open': [1.0, 2.0], 'high': [3.0, 4.0], 'low': [1.0, 2.0], 'close': [2.0, 3.0], 'volume': [3, 3]}).to_csv(os.path.join(bd, '2026-11-13.csv'), index=False)
+    pd.DataFrame({'time_et': ['2026-11-13 10:00:10.000', '2026-11-13 10:00:20.000', '2026-11-13 10:00:50.000', '2026-11-13 10:01:10.000', '2026-11-13 10:01:20.000', '2026-11-13 10:01:50.000'],
+                  'price': [1.0, 3.0, 2.0, 2.0, 4.5, 3.0], 'size': [1, 1, 1, 1, 1, 1], 'bid': 1.0, 'ask': 1.0, 'bid_size': 1, 'ask_size': 1}).to_csv(os.path.join(td, '2026-11-13.csv'), index=False)
+    tc10 = HL.tick_completeness(os.path.join(d10, 'ticks'), os.path.join(d10, 'bars'), dt.date(2026, 11, 13))
+    check('T50 bars vs ticks: a bar whose high differs from its ticks (4 vs 4.5) is named; the matching bar passes', tc10['ohlc_checked'] == 2 and len(tc10['ohlc_bad']) == 1 and '10:02' in tc10['ohlc_bad'][0], str(tc10['ohlc_bad']))
+finally: shutil.rmtree(d10, ignore_errors=True)
+t_, lg_, own_, rec_ = live_env(bars_own=pd.DataFrame({'time_et': [f"{pd.Timestamp(day) + pd.Timedelta(minutes=571 + m):%Y-%m-%d %H:%M}" for m in range(390) if not 100 <= m < 103],
+                                                     'open': 1.0, 'high': 1.0, 'low': 1.0, 'close': 1.0, 'volume': 1}))
+try: h11 = HL.check(now, fb, lg_, own_, rec_, free_gb={'C:' + chr(92): 500, 'D:' + chr(92): 500})
+finally: shutil.rmtree(t_, ignore_errors=True)
+check('T51 a regular session with 3 bar minutes missing is a problem naming them (11:11-11:13)', any('387 of 390' in x and '11:11-11:13' in x for x in h11['problems']), str(h11['problems']))
 print('ALL PASS' if not FAIL else 'FAILED: ' + ', '.join(FAIL))
 sys.exit(1 if FAIL else 0)

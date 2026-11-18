@@ -37,11 +37,11 @@ def heartbeat_due(t):
     return 18 * 60 + 10 <= m <= 23 * 60 + 55
 
 
-def ranges(mins):
+def ranges(mins, step=5):
     if not mins: return ''
     out = []; a = b = mins[0]
     for x in mins[1:]:
-        if x == b + 5: b = x
+        if x == b + step: b = x
         else: out.append((a, b)); a = b = x
     out.append((a, b)); f = lambda p: f"{(570 + p) // 60}:{(570 + p) % 60:02d}"
     return ', '.join(f(a) if a == b else f"{f(a)}-{f(b)}" for a, b in out)
@@ -130,19 +130,136 @@ def account_checks(tag, st, ev):
     return P, W, acc
 
 
+def nt_log_lines(nt_root, day):
+    files = sorted(glob.glob(os.path.join(nt_root, 'log', f"log.{str(day).replace('-', '')}.[0-9][0-9][0-9][0-9][0-9].txt")))
+    out = []
+    for f in files:
+        try:
+            with open(f, encoding='utf-8', errors='replace') as fh:
+                for ln in fh:
+                    p = ln.rstrip('\n').split('|', 3)
+                    if len(p) == 4 and len(p[0]) >= 19: out.append((p[0][:19], p[1], p[2], p[3]))
+        except OSError: continue
+    return out if files else None
+
+
 def account_position_from_nt_log(nt_root, account, day):
     if day is None: return None
-    f = os.path.join(nt_root, 'log', f"log.{str(day).replace('-', '')}.00000.txt")
-    if not os.path.exists(f): return None
-    last = None
-    pat = re.compile(r"^(\S+ \S+)\|.*Account='" + re.escape(account) + r"' Average price=\S+ Quantity=(\d+) Market position=(\w+)")
+    lines = nt_log_lines(nt_root, day)
+    if lines is None: return None
+    at_close, later = None, None
+    pat = re.compile(r"Account='" + re.escape(account) + r"' Average price=\S+ Quantity=(\d+) Market position=(\w+)")
+    for ts, _, _, msg in lines:
+        m = pat.search(msg)
+        if not m: continue
+        p = (m.group(2), int(m.group(1)), ts[11:19])
+        if ts[11:19] < '16:01:00': at_close = p
+        elif later is None and p[0] != 'Flat': later = p
+    return at_close if at_close is not None and at_close[0] != 'Flat' else later or at_close
+
+
+def mask(acct):
+    return acct if acct.lower().startswith('sim') or len(acct) <= 6 else '...' + acct[-3:]
+
+
+def nt_log_audit(nt_root, account, day, fills):
+    P, W, I = [], [], {}
+    lines = nt_log_lines(nt_root, day)
+    if lines is None: return P, W, I
+    ex = re.compile(r"Execution='[^']*' Instrument='([^']*)' Account='([^']*)' Exchange=\S+ Price=([\d.]+) Quantity=(\d+) Market position=(\w+) Operation=\w+ Order='([^']*)'")
+    od = re.compile(r"Order='([^'/]*)/([^']*)' Name='([^']*)' New state='(\w+)'")
+    names, rejected, execs = {}, [], []
+    for ts, lvl, cat, msg in lines:
+        m = od.search(msg)
+        if m:
+            names[m.group(1)] = m.group(3)
+            if m.group(4) == 'Rejected':
+                err = re.search(r"Native error='([^']+)'", msg) or re.search(r"Error='([^']+)'", msg)
+                rejected.append((ts, m.group(2), m.group(3), err.group(1) if err else ''))
+            continue
+        m = ex.search(msg)
+        if m and m.group(2) == account:
+            execs.append(dict(ts=pd.Timestamp(ts), price=float(m.group(3)), qty=int(m.group(4)), side='Buy' if m.group(5) == 'Long' else 'Sell', order=m.group(6)))
+    for ts, acct, name, err in rejected:
+        lvl = P if acct == account else W
+        lvl.append(f"{'E5n account ' + mask(acct) if acct == account else 'another account (' + mask(acct) + ')'}: order '{name}' rejected at {ts[11:19]}" + (f" - {err[:100]}" if err else ''))
+    real = []
+    if fills is not None and len(fills):
+        f = fills[fills.time_et.astype(str).str.startswith(str(day))]
+        for r in f.itertuples():
+            real.append(dict(ts=pd.Timestamp(str(r.time_et)), price=float(r.price), qty=int(r.quantity), side='Buy' if str(r.action).startswith('Buy') else 'Sell', used=False))
+    stray = []
+    for e in execs:
+        e['name'] = names.get(e['order'], '?')
+        hit = next((x for x in real if not x['used'] and x['side'] == e['side'] and x['qty'] == e['qty'] and abs(x['price'] - e['price']) < 1e-6
+                    and abs((x['ts'] - e['ts']).total_seconds()) <= 2), None)
+        if hit: hit['used'] = True
+        else: stray.append(e)
+    I['executions_matched'] = f"{len(execs) - len(stray)}/{len(execs)} account executions are E5n fills, {sum(x['used'] for x in real)}/{len(real)} E5n fills found on the account"
+    for e in stray:
+        txt = f"{e['ts']:%H:%M:%S} {e['side']} {e['qty']} @ {e['price']:.2f} (order '{e['name']}')"
+        in_rth = 570 <= e['ts'].hour * 60 + e['ts'].minute < 962
+        (P if in_rth else W).append(f"{mask(account)}: account trade E5n did not make on {day}: {txt}" + (" - a trade by hand during the session changes the account against E5n" if in_rth else ''))
+    for x in real:
+        if not x['used']: P.append(f"{mask(account)}: E5n logged a fill at {x['ts']:%H:%M:%S} ({x['side']} {x['qty']} @ {x['price']:.2f}) that NinjaTrader never executed on the account")
+    for ts, lvl, cat, msg in lines:
+        if 'Enabling NinjaScript strategy' in msg and "'E5nStrategy" in msg:
+            sp = re.search(r' Position=(\S+ \S+ \S+)', msg); ap = re.search(r'AccountPosition=(\S+ \S+ \S+)', msg)
+            if sp or ap:
+                W.append(f"E5n was started at {ts[11:19]} on {day} while " + (f"E5n's own replay held {sp.group(1).split()[-1]}" if sp else 'E5n was flat')
+                         + (f" and the account held {ap.group(1).split()[-1]}" if ap else ' and the account was flat') + " - start or compile only when both are flat")
+        elif re.search(r'(?i)error on calling|exception', msg) and 'E5n' in msg:
+            P.append(f"E5n error at {ts[11:19]} on {day}: {msg[:160]}")
+        m = re.search(r'^(\S+): Primary connection=(\w+), Price feed=(\w+)', msg)
+        if m and (m.group(2) != 'Connected' or m.group(3) != 'Connected'):
+            I.setdefault('connection_events', []).append(f"{ts[11:19]} {m.group(2)}/{m.group(3)}")
+        if lvl == '3' and 'get_order_book error : 13' not in msg and 'E5n' not in msg:
+            I.setdefault('nt_errors', []).append(f"{ts[11:19]} {msg[:140]}")
+    ce = I.get('connection_events', [])
+    down = [c for c in ce if 'Disconnected' in c or 'ConnectionLost' in c or 'Lost' in c]
+    rth_down = [c for c in down if '09:30:00' <= c[:8] < '16:00:30']
+    if rth_down: P.append(f"connection down during the session on {day}: {', '.join(rth_down[:6])}")
+    elif down: W.append(f"connection dropped outside the session on {day}: {', '.join(down[:6])} (ticks missing then; no trading affected)")
+    if I.get('nt_errors'): W.append(f"NinjaTrader errors on {day}: " + ' / '.join(I['nt_errors'][:4]))
+    return P, W, I
+
+
+def fill_delays(fills, day):
+    if fills is None or not len(fills): return []
+    f = fills[fills.time_et.astype(str).str.startswith(str(day))]
+    t = pd.to_datetime(f.time_et.astype(str), format='ISO8601')
+    sec = (t - t.dt.floor('min')).dt.total_seconds()
+    return [(str(a)[11:19], round(float(s), 2)) for a, s in zip(f.time_et, sec) if s > 3.0]
+
+
+def system_checks(now, run=None):
+    P, W, I = [], [], {}
+    run = run or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True, timeout=60, creationflags=NOWIN, encoding='utf-8', errors='replace').stdout)
     try:
-        with open(f, encoding='utf-8', errors='replace') as fh:
-            for ln in fh:
-                m = pat.search(ln)
-                if m: last = (m.group(3), int(m.group(2)), m.group(1)[11:19])
-    except OSError: return None
-    return last
+        out = run(['powershell', '-NoProfile', '-Command', "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\WindowsUpdate\\UX\\Settings' -ErrorAction SilentlyContinue).PauseUpdatesExpiryTime"]).strip()
+        if out:
+            exp = pd.Timestamp(out[:19]).tz_localize(None) if 'T' in out else pd.Timestamp(out)
+            days = (exp - pd.Timestamp(now)).total_seconds() / 86400; I['windows_update_paused_until'] = f"{exp:%Y-%m-%d}"
+            if days < 0: W.append(f"Windows Update is no longer paused (pause ended {exp:%Y-%m-%d}) - it may restart the PC during a session; pause it again (Settings > Windows Update)")
+            elif days <= 3: W.append(f"Windows Update pause ends {exp:%a %Y-%m-%d} - pause it again before then, or it may restart the PC during a session")
+        else: I['windows_update_paused_until'] = 'not paused'
+    except Exception as e: I['windows_update_paused_until'] = f'unreadable ({type(e).__name__})'
+    try:
+        since = (pd.Timestamp(now) - pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%S')
+        out = run(['powershell', '-NoProfile', '-Command', f"Get-WinEvent -FilterHashtable @{{LogName='System'; Id=41,6008; StartTime=[datetime]'{since}'}} -ErrorAction SilentlyContinue | ForEach-Object {{ $_.TimeCreated.ToString('yyyy-MM-dd HH:mm') }}"])
+        cuts = sorted(set(x.strip() for x in out.splitlines() if x.strip()))
+        I['unexpected_shutdowns_24h'] = len(cuts)
+        if cuts: W.append(f"the PC shut off without a clean shutdown in the last 24 hours ({', '.join(cuts[:4])}) - check that NinjaTrader and E5n came back")
+    except Exception as e: I['unexpected_shutdowns_24h'] = f'unreadable ({type(e).__name__})'
+    try:
+        out = run(['w32tm', '/stripchart', '/computer:time.windows.com', '/samples:1', '/dataonly'])
+        m = re.search(r'([+-]\d+\.\d+)s', out or '')
+        if m:
+            off = float(m.group(1)); I['clock_offset_s'] = off
+            if abs(off) > 1.0: W.append(f"the PC clock is off by {off:+.2f} s - fill times and the fill-cost measure depend on it; sync the clock (Settings > Time > Sync now)")
+        else: I['clock_offset_s'] = 'not measured (no time server answer)'
+    except Exception as e: I['clock_offset_s'] = f'not measured ({type(e).__name__})'
+    return P, W, I
 
 
 def compress_depth(ddir, before):
@@ -172,20 +289,25 @@ def compress_depth(ddir, before):
 def tick_completeness(tdir, bars_dir, last):
     prev = last - dt.timedelta(days=1)
     lo, hi = pd.Timestamp(prev) + pd.Timedelta(hours=18), pd.Timestamp(last) + pd.Timedelta(hours=17)
-    bar_v, tick_v = [], []
+    bar_v, tick_v, ohlc_bad, ohlc_n = [], [], [], 0
     for cdir in sorted(glob.glob(os.path.join(bars_dir, 'MNQ_*'))):
         c = os.path.basename(cdir)
         for d in (prev, last):
             bf, tf = os.path.join(cdir, f'{d}.csv'), os.path.join(tdir, c, f'{d}.csv')
             if not os.path.exists(bf): continue
             try:
-                b = pd.read_csv(bf, usecols=['time_et', 'volume'])
-                bt = pd.to_datetime(b.time_et, format='ISO8601', errors='coerce')
-                bar_v.append(b.volume.groupby(bt).sum())
+                b = pd.read_csv(bf, usecols=['time_et', 'open', 'high', 'low', 'close', 'volume'])
+                b.index = pd.to_datetime(b.time_et, format='ISO8601', errors='coerce')
+                b = b[(b.index > lo) & (b.index <= hi)]
+                bar_v.append(b.volume.groupby(level=0).sum())
                 if os.path.exists(tf):
-                    tk = pd.read_csv(tf, usecols=['time_et', 'size'])
-                    tt = pd.to_datetime(tk.time_et, format='ISO8601', errors='coerce').dt.floor('min') + pd.Timedelta(minutes=1)
-                    tick_v.append(tk['size'].groupby(tt).sum())
+                    tk = pd.read_csv(tf, usecols=['time_et', 'price', 'size'])
+                    tk['m'] = pd.to_datetime(tk.time_et, format='ISO8601', errors='coerce').dt.floor('min') + pd.Timedelta(minutes=1)
+                    g = tk.groupby('m').agg(o=('price', 'first'), h=('price', 'max'), l=('price', 'min'), c=('price', 'last'), v=('size', 'sum'))
+                    tick_v.append(g.v)
+                    j = b.join(g, how='inner'); j = j[j.volume == j.v]; ohlc_n += len(j)
+                    bad = j[((j.open - j.o).abs() > 1e-6) | ((j.high - j.h).abs() > 1e-6) | ((j.low - j.l).abs() > 1e-6) | ((j.close - j.c).abs() > 1e-6)]
+                    ohlc_bad += [f"{t:%m-%d %H:%M} bar {r.open:g}/{r.high:g}/{r.low:g}/{r.close:g} ticks {r.o:g}/{r.h:g}/{r.l:g}/{r.c:g}" for t, r in bad.iterrows()]
             except (OSError, ValueError, KeyError, pd.errors.ParserError, pd.errors.EmptyDataError): continue
     if not bar_v: return None
     bv = pd.concat(bar_v).groupby(level=0).sum()
@@ -197,7 +319,7 @@ def tick_completeness(tdir, bars_dir, last):
     for k, x in enumerate(i):
         if k == 0 or x - i[k - 1] > pd.Timedelta(minutes=1): st = x
         if k == len(i) - 1 or i[k + 1] - x > pd.Timedelta(minutes=1): runs.append((st, x, int(short[st:x].sum())))
-    return dict(bar=int(bv.sum()), ticks=int(tv.clip(upper=bv).sum()), minutes=len(bv), equal=int((bv == tv).sum()), runs=runs)
+    return dict(bar=int(bv.sum()), ticks=int(tv.clip(upper=bv).sum()), minutes=len(bv), equal=int((bv == tv).sum()), runs=runs, ohlc_checked=ohlc_n, ohlc_bad=ohlc_bad)
 
 
 def fmt_run(r):
@@ -206,9 +328,11 @@ def fmt_run(r):
     return f"{span} ({n:,} contracts)"
 
 
-def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb=None, rec_status=None, ticks_dir=None):
+def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb=None, rec_status=None, ticks_dir=None, system=False):
     P, W, I = [], [], {}
     today = now.date()
+    if system:
+        sP, sW, sI = system_checks(now); P += sP; W += sW; I['system'] = sI
     fix = rebuild_parity()
     if fix:
         (P if 'FAILED' in fix or 'missing' in fix else I.setdefault('repairs', [])).append(fix)
@@ -316,6 +440,11 @@ def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb
             if len(c1):
                 r['fill_cost_last_session'] = f"{c1.ticks.mean():+.2f} ticks a side over {int(c1.n.sum())} fills"
                 if c1.ticks.mean() > 4.0: W.append(f"{tag}: fills on {last} cost {c1.ticks.mean():+.2f} ticks a side against the decision bar's close (2.35 assumed)")
+            slow = fill_delays(fx, last)
+            if slow: W.append(f"{tag}: {len(slow)} fill(s) on {last} came more than 3 s after the decision minute (" + ', '.join(f"{a} +{s:g} s" for a, s in slow[:5]) + ") - order routing or the feed was slow")
+        acct = tag.split('_', 1)[1] if '_' in tag else tag
+        aP, aW, aI = nt_log_audit(os.path.dirname(os.path.dirname(logs_dir)), acct, last, fx if fx is not None else None)
+        P += aP; W += aW; r.update(aI)
     own = sorted(glob.glob(os.path.join(own_dir, 'MNQ_*', f'{last}.csv'))) if last else []
     rec = sorted(glob.glob(os.path.join(rec_dir, 'MNQ_*', f'{last}_bars1minute.csv'))) if last else []
     if own:
@@ -323,7 +452,9 @@ def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb
         if obad: P.append(f"strategy bar log {os.path.basename(own[-1])} has {obad} broken line(s)")
         t = pd.to_datetime(o.time_et, errors='coerce'); rth = ((t.dt.hour * 60 + t.dt.minute) > 570) & ((t.dt.hour * 60 + t.dt.minute) <= 960)
         I['own_bars_regular_session'] = int(rth.sum())
-        if live and rth.sum() < 300: W.append(f"strategy bar log for {last} has only {int(rth.sum())} regular-session minutes")
+        if live and rth.sum() < 390:
+            have = set((t[rth].dt.hour * 60 + t[rth].dt.minute - 570).astype(int))
+            P.append(f"strategy bar log for {last} has {int(rth.sum())} of 390 regular-session minutes (missing {ranges([m for m in range(1, 391) if m not in have], 1)})")
         if rec:
             rr, _, _ = read_log(rec[-1])
             if rr is not None and len(rr):
@@ -353,6 +484,8 @@ def check(now, bars, logs_dir, own_dir, rec_dir, disks=('C:\\', 'D:\\'), free_gb
     if tc is not None:
         I['ticks_vs_bars'] = f"{tc['ticks']:,} of {tc['bar']:,} contracts in the {last} session ({tc['ticks'] / tc['bar']:.3%}), volume equal on {tc['equal']}/{tc['minutes']} minutes"
         I['tick_holes'] = [fmt_run(r) for r in tc['runs']]
+        I['bars_vs_ticks'] = f"open/high/low/close equal on {tc['ohlc_checked'] - len(tc['ohlc_bad'])}/{tc['ohlc_checked']} complete minutes"
+        if tc['ohlc_bad']: P.append(f"E5n's bars differ from its own ticks on {len(tc['ohlc_bad'])} minute(s) in the {last} session (" + '; '.join(tc['ohlc_bad'][:3]) + ") - the bar data E5n decides on is not what traded")
         if tc['runs']:
             W.append(f"ticks missing in the {last} session: {tc['bar'] - tc['ticks']:,} of {tc['bar']:,} contracts in " + ', '.join(fmt_run(r) for r in tc['runs'][:6])
                      + (' ...' if len(tc['runs']) > 6 else '') + " - E5n was stopped or restarting then")
