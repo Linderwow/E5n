@@ -335,5 +335,10 @@ t_, lg_, own_, rec_ = live_env(bars_own=pd.DataFrame({'time_et': [f"{pd.Timestam
 try: h11 = HL.check(now, fb, lg_, own_, rec_, free_gb={'C:' + chr(92): 500, 'D:' + chr(92): 500})
 finally: shutil.rmtree(t_, ignore_errors=True)
 check('T51 a regular session with 3 bar minutes missing is a problem naming them (11:11-11:13)', any('387 of 390' in x and '11:11-11:13' in x for x in h11['problems']), str(h11['problems']))
+Lo = pd.DataFrame({'book_usd': [4.0] * 25, 'model_usd': [-61.0] * 25})
+ro_on = CK.ledger(Lo); ro_off = CK.ledger(Lo, model_off=True); ro_back = CK.ledger(pd.DataFrame({'book_usd': [4.0] * 25, 'model_usd': [40.0] * 25}), model_off=True)
+check('T52 model leg below its 5% line: STOP AND REVIEW while it trades; once switched off it is a shadow note, not a stop, and a shadow back at its median says so',
+      ro_on['status'] == 'STOP AND REVIEW' and ro_off['status'] != 'STOP AND REVIEW' and 'OFF' in ro_off.get('model_note', '')
+      and not any(f.startswith('MODEL LEG BELOW') for f in ro_off['flags']) and any('candidate to switch it on' in f for f in ro_back['flags']), str((ro_on, ro_off, ro_back)))
 print('ALL PASS' if not FAIL else 'FAILED: ' + ', '.join(FAIL))
 sys.exit(1 if FAIL else 0)

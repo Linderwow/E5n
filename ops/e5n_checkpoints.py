@@ -28,7 +28,7 @@ def line(n, pts, center=None, zero_mean=False):
     return float(np.interp(n, xs, ys))
 
 
-def ledger(L):
+def ledger(L, model_off=False):
     if L is None or not len(L): return dict(sessions=0, status='no sessions yet')
     n = len(L); book = float(L.book_usd.astype(float).sum()); model = float(L.model_usd.astype(float).sum())
     r = dict(sessions=n, book_usd=round(book, 2), model_usd=round(model, 2),
@@ -38,7 +38,11 @@ def ledger(L):
     flags = []
     if r['dry_sessions'] > DRY_MAX: flags.append(f"BOOK {r['dry_spell']}")
     if book < r['book_p5']: flags.append(f"BOOK BELOW its fair 5% line (${book:+,.0f} vs ${r['book_p5']:+,.0f} at {n} sessions) - worse than 19 of 20 fair outcomes")
-    if model < r['model_p5']: flags.append(f"MODEL LEG BELOW its fair 5% line (${model:+,.0f} vs ${r['model_p5']:+,.0f})")
+    r['model_off'] = bool(model_off)
+    if model_off:
+        r['model_note'] = f"model leg OFF (stopped at its 5% line), scored as a shadow: ${model:+,.0f} (5% line ${r['model_p5']:+,.0f}, median ${r['model_median']:+,.0f})"
+        if model >= r['model_median']: flags.append(f"model leg shadow back at its median (${model:+,.0f} vs ${r['model_median']:+,.0f}) - candidate to switch it on again")
+    elif model < r['model_p5']: flags.append(f"MODEL LEG BELOW its fair 5% line (${model:+,.0f} vs ${r['model_p5']:+,.0f})")
     if model > r['model_noedge_p95']: flags.append(f"model leg above the no-edge 95% line (${model:+,.0f} vs ${r['model_noedge_p95']:+,.0f}) - its edge looks real")
     r['flags'] = flags
     due = [c for c in N[1:] if n >= c]

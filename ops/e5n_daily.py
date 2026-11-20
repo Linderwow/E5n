@@ -304,14 +304,16 @@ def main():
         if d_ in py:
             b_ = bd.get(d_, dict(pts=0.0, trips=0.0)); now_book = usd(py[d_]['chk_pts'], py[d_]['chk_trips']) + usd(b_['pts'], b_['trips'])
             if abs(now_book - float(r_.book_usd)) > 1.0: restated.append((str(d_), float(r_.book_usd), round(now_book, 2)))
-    ck_ledger = CK.ledger(L); ck_shadow = CK.shadow(shadow if shadow.get('sessions') else None)
+    logs, st = strategy_logs(dec, marks)
+    live_st = [v for k, v in st.items() if 'Backtest' not in k and isinstance(v, dict) and 'contracts' in v]
+    model_off = bool(live_st) and all(v.get('contracts') == 0 for v in live_st)
+    ck_ledger = CK.ledger(L, model_off=model_off); ck_shadow = CK.shadow(shadow if shadow.get('sessions') else None)
     try:
         Tf = F.features(S); Tf['mend'] = np.array([CAL.month_end_flag(d.date()) for d in S.D.date], float)[Tf.k.values]
         Tf = Tf[(Tf.k >= WARMUP) & S.present[Tf.k.values, Tf.dec.values - 1] & (Tf.date > TRAIN_END)].reset_index(drop=True)
         ff5, _ = M.predict(Tf.date.values, Tf[F.FEATS].values) if len(Tf) else (np.zeros(0), None)
         flow = FL.nightly(Tf, ff5, now)
     except Exception as e: flow = dict(error=f"{type(e).__name__}: {e}")
-    logs, st = strategy_logs(dec, marks)
     try: health = H.check(now, bars, os.path.join(NT_E5N, 'logs'), OWN_BARS, REC, system=True)
     except Exception as e: health = dict(problems=[f"live checks failed: {type(e).__name__}: {e}"], warnings=[], info={})
     problems += health['problems']
@@ -323,7 +325,8 @@ def main():
     big = [x_ for x_ in restated if abs(x_[2] - x_[1]) > 50]
     if big: health['warnings'].append(f"ledger day(s) recorded with different bars than today's: " + ', '.join(f"{d} ${a:+,.0f} -> ${b:+,.0f}" for d, a, b in big[:5]))
     summary = (f"Forward test: {ck_ledger.get('sessions', 0)} sessions, book ${ck_ledger.get('book_usd', 0):+,.0f} (fair median ${ck_ledger.get('book_median', 0):+,.0f}, "
-               f"stop line ${ck_ledger.get('book_p5', 0):+,.0f}) - {ck_ledger.get('status')}; {ck_ledger.get('checkpoint', '')}; {ck_ledger.get('dry_spell', '')}. Stock shadow: {ck_shadow.get('status')}. "
+               f"stop line ${ck_ledger.get('book_p5', 0):+,.0f}) - {ck_ledger.get('status')}; {ck_ledger.get('checkpoint', '')}; {ck_ledger.get('dry_spell', '')}. "
+               + (f"{ck_ledger['model_note'][0].upper()}{ck_ledger['model_note'][1:]}. " if ck_ledger.get('model_note') else '') + f"Stock shadow: {ck_shadow.get('status')}. "
                f"Order flow: {flow.get('verdict', flow.get('error', ''))}. Band profit target (shadow, not traded): {target.get('status', target.get('error', 'no sessions yet'))}. "
                f"Band 2-ATR stop + 6-ATR target (shadow, not traded): {bracket_sh.get('status', bracket_sh.get('error', 'no sessions yet'))}.")
     health['summary'] = summary
